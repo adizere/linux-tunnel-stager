@@ -1,4 +1,4 @@
-obj-m := ip_gre.o
+obj-m := ipip.o
 
 CMD	:= $(MAKE)
 KDIR := /lib/modules/$(shell uname -r)/build
