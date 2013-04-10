@@ -108,6 +108,10 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/if_ether.h>
 
+/* stager dev - need the following header for in_aton() */
+#include <linux/inet.h>
+
+
 #include <net/sock.h>
 #include <net/ip.h>
 #include <net/icmp.h>
@@ -199,6 +203,10 @@ static struct ip_tunnel *ipip_tunnel_lookup(struct net *net,
 
     /* stager dev */
     printk(KERN_INFO "* ipip_tunnel_lookup\n");
+    printk(KERN_INFO "    using ipip_net_id: [%d]\n", ipip_net_id);
+    printk(KERN_INFO "    searching the tunnel associated with remote [%pI4]; local [%pI4]\n",
+        &remote, &local);
+    printk(KERN_INFO "    using hashes: remote [%u]; local [%u]\n", h0, h1);
 
     for_each_ip_tunnel_rcu(ipn->tunnels_r_l[h0 ^ h1])
         if (local == t->parms.iph.saddr &&
@@ -491,6 +499,9 @@ static int ipip_rcv(struct sk_buff *skb)
     }
     rcu_read_unlock();
 
+    /* stager dev */
+    printk(KERN_INFO "    tunnel_lookup returned NULL && packet dropped\n");
+
     return -1;
 }
 
@@ -516,7 +527,11 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
     int    mtu;
 
     /* stager dev */
+    // __be32 mangle_dst = in_aton("192.168.3.2");
+    // __be32 mangle_src = in_aton("192.168.2.2");
+
     printk(KERN_INFO "* ipip_tunnel_xmit\n");
+
 
     if (skb->protocol != htons(ETH_P_IP))
         goto tx_error;
@@ -533,8 +548,12 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
         dst = rt->rt_gateway;
     }
 
+    /* stager dev */
+    /* change the header IP src and dst to be the hardcoded ones */
+    // printk(KERN_INFO "    about to change the route\n");
     rt = ip_route_output_ports(dev_net(dev), &fl4, NULL,
                    dst, tiph->saddr,
+                    // mangle_dst, mangle_src,
                    0, 0,
                    IPPROTO_IPIP, RT_TOS(tos),
                    tunnel->parms.link);
@@ -543,6 +562,10 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
         goto tx_error_icmp;
     }
     tdev = rt->dst.dev;
+
+
+    /* stager dev*/
+    printk(KERN_INFO "    egress using device with name: [%s]\n", tdev->name);
 
     if (tdev == dev) {
         ip_rt_put(rt);
