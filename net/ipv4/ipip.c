@@ -224,6 +224,12 @@ static struct ip_tunnel *ipip_tunnel_lookup(struct net *net,
     t = rcu_dereference(ipn->tunnels_wc[0]);
     if (t && (t->dev->flags&IFF_UP))
         return t;
+
+    /* stager dev */
+    /* override the lookup procedure and return our only tunnel */
+    // printk(KERN_INFO "    overriding lookup\n");
+    // return rcu_dereference(ipn->tunnels_r_l[h0 ^ h1]);
+
     return NULL;
 }
 
