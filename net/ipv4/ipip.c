@@ -110,6 +110,7 @@
 
 /* stager dev - need the following header for in_aton() */
 #include <linux/inet.h>
+#include "ipip_stager.h"
 
 
 #include <net/sock.h>
