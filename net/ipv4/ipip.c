@@ -110,7 +110,7 @@
 
 /* stager dev - need the following header for in_aton() */
 #include <linux/inet.h>
-#include "ipip_stager.h"
+// #include "ipip_stager.h"
 
 
 #include <net/sock.h>
@@ -495,8 +495,29 @@ static int ipip_rcv(struct sk_buff *skb)
         tstats->rx_bytes += skb->len;
         u64_stats_update_end(&tstats->syncp);
 
-        __skb_tunnel_rx(skb, tunnel->dev);
 
+        /* stager dev */
+        /* Establish the transport header pointer */
+        skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
+
+        /* stager dev */
+        struct iphdr *_ipheader = ip_hdr(skb);
+        printk(KERN_INFO "[ipip_rcv] We're supposedly in the inner IP header now\n");
+        printk(KERN_INFO "[ipip_rcv] Remote:[%pI4]; Local: [%pI4];\n",
+            &_ipheader->saddr, &_ipheader->daddr);
+
+        if (_ipheader->protocol == IPPROTO_TCP){
+            struct tcphdr *tcp_header = tcp_hdr(skb);
+            printk(KERN_INFO "[ipip_rcv] Port src: [%u]; dst: [%u]; seq: [%ul]\n",
+                ntohs(tcp_header->source), ntohs(tcp_header->dest), ntohl(tcp_header->seq));
+        } else {
+            printk(KERN_INFO "[ipip_rcv] Protocol is not TCP\n");
+            if (_ipheader->protocol == IPPROTO_ICMP){
+                printk(KERN_INFO "[ipip_rcv] Protocol is ICMP\n");
+            }
+        }
+
+        __skb_tunnel_rx(skb, tunnel->dev);
         ipip_ecn_decapsulate(iph, skb);
 
         netif_rx(skb);
