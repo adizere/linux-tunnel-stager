@@ -3,18 +3,20 @@
 
 #include <linux/inet.h>
 
-struct connection_pair {
+/* Identifies a Layer 4 flow */
+struct l4_flow {
     __u16 src_port;
     __u16 dst_port;
 };
 
-static struct connection_pair iface_connections_eth0[50];
-static struct connection_pair iface_connections_eth1[50];
+
+static struct l4_flow iface_connections_eth0[50];
+static struct l4_flow iface_connections_eth1[50];
 
 static unsigned int iface_conn_count_eth0 = 0;
 static unsigned int iface_conn_count_eth1 = 0;
 
-static void add_connection_pair_to_iface(struct sk_buff *skb, int iface);
-static int  get_iface_for_connection(struct sk_buff *skb);
+void add_l4_flow_to_iface(struct sk_buff *skb, int iface);
+int  get_iface_for_skb(struct sk_buff *skb);
 
-#endif  /* _LINUX_INET_H */
+#endif  /* _LINUX_NET_IPIP_STAGER */
