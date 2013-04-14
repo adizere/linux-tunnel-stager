@@ -254,18 +254,29 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
 static int
 get_iface_for_skb(struct sk_buff *skb)
 {
-    struct tcphdr *tcp_header = tcp_hdr(skb);
-    __be16 source_port = ntohs(tcp_header->source);
-    __be16 dest_port = ntohs(tcp_header->dest);
+    struct tcphdr *tcp_header;
+    __be16 source_port;
+    __be16 dest_port;
     int i;
+
+    skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
+    tcp_header = tcp_hdr(skb);
+    source_port = ntohs(tcp_header->source);
+    dest_port = ntohs(tcp_header->dest);
+
+    printk(KERN_INFO "[get_iface_for_skb] with: [%d, %d]\n",
+        source_port, dest_port);
 
     for (i = 0; i < iface_conn_count_eth1; ++i)
     {
         if ((iface_connections_eth1[i]->src_port == source_port) &&
-            (iface_connections_eth1[i]->dst_port == dest_port))
+            (iface_connections_eth1[i]->dst_port == dest_port)){
+            printk(KERN_INFO "[get_iface_for_skb] found flow for [1]\n");
             return 1;
+        }
     }
 
+    printk(KERN_INFO "[get_iface_for_skb] flow not found, using [0]\n");
     return 0;
 }
 
@@ -643,6 +654,9 @@ static int ipip_rcv(struct sk_buff *skb)
         u64_stats_update_end(&tstats->syncp);
 
         /* stager dev */
+
+        printk(KERN_INFO "[ipip_rcv] outer: [%pI4, %pI4]; inner: [%pI4, %pI4]\n",
+            &iph->saddr, &iph->daddr, &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr);
         if ((in_aton("192.168.0.2") == iph->daddr) ||
             (in_aton("192.168.1.2") == iph->daddr)) {
             add_l4_flow_to_iface(skb, 0);
@@ -714,6 +728,7 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
     if (old_iph->protocol == IPPROTO_TCP){
         i = get_iface_for_skb(skb);
     } else {
+        printk(KERN_INFO "[ipip_tunnel_xmit] Not a TCP flow. Using default iface [0]\n");
         i = 0;
     }
     printk(KERN_INFO "[ipip_tunnel_xmit] Sending packet on iface: eth%d.\n", i);
