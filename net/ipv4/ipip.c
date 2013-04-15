@@ -110,6 +110,7 @@
 
 /* stager dev - need the following header for in_aton() */
 #include <linux/inet.h>
+#include <net/tcp.h> /* for tcp_parse_options() */
 // #include "ipip_stager.h"
 
 
@@ -124,6 +125,163 @@
 
 #define HASH_SIZE  16
 #define HASH(addr) (((__force u32)addr^((__force u32)addr>>4))&0xF)
+
+
+
+/* Stager Dev */
+
+struct l4_flow {
+    __u16 src_port;
+    __u16 dst_port;
+};
+
+
+static struct l4_flow *iface_connections_eth0[50];
+static struct l4_flow *iface_connections_eth1[50];
+
+static unsigned int iface_conn_count_eth0 = 0;
+static unsigned int iface_conn_count_eth1 = 0;
+
+/*
+    Should update the RTT average value per iface
+*/
+static void
+_update_iface_stats(struct sk_buff *skb)
+{
+    const u8 *hash_location; /* we'll ignore this anyway */
+    struct tcp_options_received *rx_opt; /* defined in linux/tcp.h */
+
+    rx_opt = (struct tcp_options_received*)
+        kmalloc(sizeof(struct tcp_options_received), GFP_KERNEL);
+
+    tcp_parse_options(skb, rx_opt, &hash_location, 0);
+
+    printk(KERN_INFO "[_update_iface_stats] Header options: tsval: [%u]; tsecr: [%d]; now: [%u]\n",
+        rx_opt->rcv_tsval, rx_opt->rcv_tsecr, tcp_time_stamp);
+}
+
+/* iface can be:
+    * 0 -> add the flow to iface_connections_eth0
+    * 1 -> add the flow to iface_connections_eth1
+*/
+static void
+add_l4_flow_to_iface(struct sk_buff *skb, int iface)
+{
+    struct iphdr *_ipheader = ip_hdr(skb);
+
+    skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
+
+    if (_ipheader->protocol == IPPROTO_TCP){
+        struct tcphdr *tcp_header = tcp_hdr(skb);
+        struct l4_flow *flow_id = NULL;
+        int i, *marked_iface_count, *unmarked_iface_count;
+        struct l4_flow **marked_iface, **unmarked_iface;
+
+        flow_id = (struct l4_flow*) kmalloc(sizeof(struct l4_flow), GFP_KERNEL);
+        if (flow_id == NULL)
+            return;
+
+        _update_iface_stats(skb);
+
+        printk(KERN_INFO "[add_l4_flow_to_iface] Port src: [%u]; dst: [%u]; seq: [%ul]\n",
+            ntohs(tcp_header->source), ntohs(tcp_header->dest), ntohl(tcp_header->seq));
+
+        flow_id->src_port = ntohs(tcp_header->source);
+        flow_id->dst_port = ntohs(tcp_header->dest);
+
+        if (iface == 0){
+            marked_iface = iface_connections_eth0;
+            marked_iface_count = &iface_conn_count_eth0;
+
+            unmarked_iface = iface_connections_eth1;
+            unmarked_iface_count = &iface_conn_count_eth1;
+        } else {
+            marked_iface = iface_connections_eth1;
+            marked_iface_count = &iface_conn_count_eth1;
+
+            unmarked_iface = iface_connections_eth0;
+            unmarked_iface_count = &iface_conn_count_eth0;
+        }
+
+        /* Scoatem flow_id din vectorul cu flowurile corespondente interfetei
+            unmarked
+        */
+        for (i = 0; i < *unmarked_iface_count-1; ++i)
+        {
+            if ((unmarked_iface[i]->src_port == flow_id->src_port) &&
+                (unmarked_iface[i]->dst_port == flow_id->dst_port)){
+                kfree(unmarked_iface[i]);
+
+                unmarked_iface[i] = unmarked_iface[*unmarked_iface_count-1];
+                (*unmarked_iface_count)--;
+                printk(KERN_INFO "[add_l4_flow_to_iface] Removed flow id [%d, %d]"
+                    "from interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
+                    (iface+1)%2, *unmarked_iface_count);
+                break;
+            }
+        }
+
+        /*
+            Daca flow_id nu e in lista de flowuri din interfata marked atunci
+            il adaugam.
+        */
+        for (i = 0; i < *marked_iface_count; ++i)
+        {
+            if ((marked_iface[i]->src_port == flow_id->src_port) &&
+                (marked_iface[i]->dst_port == flow_id->dst_port)){
+                printk(KERN_INFO "[add_l4_flow_to_iface] Found flow id [%d, %d] "
+                    "in interface [%d]\n", flow_id->src_port, flow_id->dst_port, iface);
+                break;
+            }
+        }
+        if (i == *marked_iface_count) {
+            marked_iface[i] = flow_id;
+            (*marked_iface_count)++;
+
+            printk(KERN_INFO "[add_l4_flow_to_iface] Added flow id [%d, %d]"
+                "to interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
+                iface, *marked_iface_count);
+        }
+    } else {
+        printk(KERN_INFO "[ipip_rcv] Protocol is not TCP\n");
+        if (_ipheader->protocol == IPPROTO_ICMP){
+            printk(KERN_INFO "[ipip_rcv] Protocol is ICMP\n");
+        }
+    }
+}
+
+
+static int
+get_iface_for_skb(struct sk_buff *skb)
+{
+    struct tcphdr *tcp_header;
+    __be16 source_port;
+    __be16 dest_port;
+    int i;
+
+    skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
+    tcp_header = tcp_hdr(skb);
+    source_port = ntohs(tcp_header->source);
+    dest_port = ntohs(tcp_header->dest);
+
+    printk(KERN_INFO "[get_iface_for_skb] with: [%d, %d]\n",
+        source_port, dest_port);
+
+    for (i = 0; i < iface_conn_count_eth1; ++i)
+    {
+        if ((iface_connections_eth1[i]->src_port == source_port) &&
+            (iface_connections_eth1[i]->dst_port == dest_port)){
+            printk(KERN_INFO "[get_iface_for_skb] found flow for [1]\n");
+            return 1;
+        }
+    }
+
+    printk(KERN_INFO "[get_iface_for_skb] flow not found, using [0]\n");
+    return 0;
+}
+
+/* Stager Dev */
+
 
 static int ipip_net_id __read_mostly;
 struct ipip_net {
@@ -228,8 +386,8 @@ static struct ip_tunnel *ipip_tunnel_lookup(struct net *net,
 
     /* stager dev */
     /* override the lookup procedure and return our only tunnel */
-    // printk(KERN_INFO "    overriding lookup\n");
-    // return rcu_dereference(ipn->tunnels_r_l[h0 ^ h1]);
+    printk(KERN_INFO "    overriding lookup\n");
+    return rcu_dereference(ipn->tunnels_r_l[h0 ^ h1]);
 
     return NULL;
 }
@@ -495,26 +653,15 @@ static int ipip_rcv(struct sk_buff *skb)
         tstats->rx_bytes += skb->len;
         u64_stats_update_end(&tstats->syncp);
 
-
         /* stager dev */
-        /* Establish the transport header pointer */
-        skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
 
-        /* stager dev */
-        struct iphdr *_ipheader = ip_hdr(skb);
-        printk(KERN_INFO "[ipip_rcv] We're supposedly in the inner IP header now\n");
-        printk(KERN_INFO "[ipip_rcv] Remote:[%pI4]; Local: [%pI4];\n",
-            &_ipheader->saddr, &_ipheader->daddr);
-
-        if (_ipheader->protocol == IPPROTO_TCP){
-            struct tcphdr *tcp_header = tcp_hdr(skb);
-            printk(KERN_INFO "[ipip_rcv] Port src: [%u]; dst: [%u]; seq: [%ul]\n",
-                ntohs(tcp_header->source), ntohs(tcp_header->dest), ntohl(tcp_header->seq));
+        printk(KERN_INFO "[ipip_rcv] outer: [%pI4, %pI4]; inner: [%pI4, %pI4]\n",
+            &iph->saddr, &iph->daddr, &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr);
+        if ((in_aton("192.168.0.2") == iph->daddr) ||
+            (in_aton("192.168.1.2") == iph->daddr)) {
+            add_l4_flow_to_iface(skb, 0);
         } else {
-            printk(KERN_INFO "[ipip_rcv] Protocol is not TCP\n");
-            if (_ipheader->protocol == IPPROTO_ICMP){
-                printk(KERN_INFO "[ipip_rcv] Protocol is ICMP\n");
-            }
+            add_l4_flow_to_iface(skb, 1);
         }
 
         __skb_tunnel_rx(skb, tunnel->dev);
@@ -555,9 +702,8 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
     int    mtu;
 
     /* stager dev */
-    // __be32 mangle_dst = in_aton("192.168.3.2");
-    // __be32 mangle_src = in_aton("192.168.2.2");
-
+    __be32 mangle_dst;
+    __be32 mangle_src;
     printk(KERN_INFO "* ipip_tunnel_xmit\n");
 
 
@@ -578,10 +724,35 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
 
     /* stager dev */
     /* change the header IP src and dst to be the hardcoded ones */
-    // printk(KERN_INFO "    about to change the route\n");
+    int i;
+    if (old_iph->protocol == IPPROTO_TCP){
+        i = get_iface_for_skb(skb);
+    } else {
+        printk(KERN_INFO "[ipip_tunnel_xmit] Not a TCP flow. Using default iface [0]\n");
+        i = 0;
+    }
+    printk(KERN_INFO "[ipip_tunnel_xmit] Sending packet on iface: eth%d.\n", i);
+
+    /* Need to mangle if 1 */
+    if (i == 1){
+        /* We're on site A */
+        if (tiph->saddr == in_aton("192.168.0.2")){
+            mangle_dst = in_aton("192.168.3.2");
+            mangle_src = in_aton("192.168.2.2");
+        } else {
+            /* We're on site B */
+            mangle_dst = in_aton("192.168.2.2");
+            mangle_src = in_aton("192.168.3.2");
+        }
+    } else {
+        /* No need to mangle; by default we're sending on 0 */
+        mangle_src = tiph->saddr;
+        mangle_dst = dst;
+    }
+
     rt = ip_route_output_ports(dev_net(dev), &fl4, NULL,
-                   dst, tiph->saddr,
-                    // mangle_dst, mangle_src,
+                   // dst, tiph->saddr,
+                   mangle_dst, mangle_src,
                    0, 0,
                    IPPROTO_IPIP, RT_TOS(tos),
                    tunnel->parms.link);
