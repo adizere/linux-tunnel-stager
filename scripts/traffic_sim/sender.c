@@ -52,7 +52,7 @@ main(int argc, char **argv) {
     }
     printf("everything is ok so far..\n");
     printf("%d\n", argc);
-    bandwidth = 100000000;
+    bandwidth = 1000;
     i = send(sock, &bandwidth, sizeof(int), 0);
     printf("am trimis la server %d bytes.\n",i);
 
@@ -84,6 +84,10 @@ main(int argc, char **argv) {
 			nanosleep(&sleepts, &tmp);
 		}
 	}
+
+	/* Don't rush it */
+	sleep(1);
+
 	j += ((k=send(sock, chunk, bandwidth%packet_size, 0))>0? k: 0);
 	if (k==-1) perror("error at send: ");
 	gettimeofday(&now, 0);

@@ -48,7 +48,7 @@ main(int argc, char* argv[]) {
     perror("error at bind: ");
    }
    listen(sock, 5);
-   printf("sender is up and running ..\n");
+   printf("receiver is up and running ..\n");
 
    int len_addr = sizeof(struct sockaddr);
    sd = accept(sock, (struct sockaddr *) &client, &len_addr);
