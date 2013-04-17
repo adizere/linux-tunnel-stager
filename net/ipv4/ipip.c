@@ -111,6 +111,7 @@
 /* stager dev - need the following header for in_aton() */
 #include <linux/inet.h>
 #include <net/tcp.h> /* for tcp_parse_options() */
+/* FIXME: move all stager-related code to a separate source */
 // #include "ipip_stager.h"
 
 
@@ -126,14 +127,20 @@
 #define HASH_SIZE  16
 #define HASH(addr) (((__force u32)addr^((__force u32)addr>>4))&0xF)
 
+
 /* Stager Dev */
+/* FIXME:
+    * lists with connections count should not be hardcoded
+    * lists with connections/conn count should be actively managed
+*/
+#define PATHS_COUNT 2
 
 struct l4_flow {
     __u16 src_port;
     __u16 dst_port;
 };
 
-/* Packet descriptor: not used yet */
+/* Packet descriptor: FIXME not used yet */
 struct packet_descriptor {
     __be32 id;
 
@@ -151,31 +158,32 @@ static unsigned int iface_conn_count_eth0 = 0;
 static unsigned int iface_conn_count_eth1 = 0;
 
 
-/* average rtt */
-static unsigned int srtt_eth0 = 0;
-static unsigned int srtt_eth1 = 0;
+/* smoothed rtt (SRTT) */
+static u16 srtt[PATHS_COUNT] = {0, 0};
+
+/* minimum srtt */
+static u16 srtt_min[PATHS_COUNT] = {USHRT_MAX, USHRT_MAX};
+
+/* value of the srtt when the last restage was performed */
+static u16 last_restage_srtt_val[PATHS_COUNT] = {USHRT_MAX, USHRT_MAX};
 
 /* congestion factor */
-static unsigned int cf_eth0 = 0;
-static unsigned int cf_eth1 = 0;
-static unsigned int cf_total = 0;
-
-
-/* traffic weight, expressed in % of 100 */
-static unsigned int tw_eth0 = 50;
-static unsigned int tw_eth1 = 50;
+static u16 cf[PATHS_COUNT] = {0, 0};
 
 
 /*
     Should update the RTT average value per iface
+
+    Called from ipip_rcv() -> add_l4_flow_to_iface()
 */
 static void
 _update_iface_stats(struct sk_buff *skb, int iface)
 {
     const u8 *hash_location; /* we'll ignore this anyway */
     struct tcp_options_received *rx_opt; /* defined in linux/tcp.h */
-    unsigned int *srtt, *tw, *cf;
+    u16 *this_srtt, *this_srtt_min, *this_cf;
     u32 rtt_instant;
+    u32 rtt_diff;
     struct tcphdr *tcp_header = tcp_hdr(skb);
 
     /* RST packets should not carry timestamps (rfc1323) */
@@ -184,16 +192,7 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 
     printk(KERN_INFO " * _update_iface_stats\n");
 
-    if (iface == 0){
-        rcu_assign_pointer(srtt, &srtt_eth0);
-        rcu_assign_pointer(tw, &tw_eth0);
-        rcu_assign_pointer(cf, &cf_eth0);
-    } else {
-        rcu_assign_pointer(srtt, &srtt_eth1);
-        rcu_assign_pointer(tw, &tw_eth1);
-        rcu_assign_pointer(cf, &cf_eth1);
-    }
-
+    /* Structure in whil we'll keep the TCP Header Options */
     rx_opt = (struct tcp_options_received*)
         kmalloc(sizeof(struct tcp_options_received), GFP_ATOMIC);
 
@@ -203,31 +202,34 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     if (rx_opt->rcv_tsecr == 0 || rx_opt->rcv_tsecr > tcp_time_stamp)
         return;
 
-    printk(KERN_INFO "[_update_iface_stats] Header options: tsval: [%u]; tsecr: [%u]; now: [%u]\n",
-        rx_opt->rcv_tsval, rx_opt->rcv_tsecr, tcp_time_stamp);
-
     /* Get the last RTT */
     rtt_instant = tcp_time_stamp - rx_opt->rcv_tsecr;
 
+    rcu_assign_pointer(this_srtt, &srtt[iface]);
+    rcu_assign_pointer(this_srtt_min, &srtt_min[iface]);
+    rcu_assign_pointer(this_cf, &cf[iface]);
+
     /* Compute the average RTT */
-    *srtt = 9*(*srtt) + rtt_instant;
-    *srtt = (*srtt * 205) >> 11; /* division by 10, sort of */
+    *this_srtt = 9*(*this_srtt) + rtt_instant;
+    *this_srtt = (*this_srtt * 205) >> 11; /* division by 10, sort of */
 
-    /* Adjust the congestion factor */
-    *cf = (rtt_instant > *srtt) ?
-        rtt_instant - *srtt :
-        0;
+    /* FIXME: we should not depend on this hardcodede value */
+    if (*this_srtt < *this_srtt_min && *this_srtt > 19)
+        *this_srtt_min = *this_srtt;
 
-    cf_total = cf_eth0 + cf_eth1;
+    /* difference between the instant RTT and the smoothed RTT */
+    rtt_diff = abs(rtt_instant - *this_srtt);
 
-    if (cf_total != 0){
-        *tw = 100 - ((100*(*cf))/cf_total);
-    }
 
-    printk(KERN_INFO "[_update_iface_stats] Final stats for iface %d "
-        "rtt: %d srtt: %d %d cf: %d %d tw: %d %d cf_total: %d\n",
-        iface, rtt_instant, srtt_eth0, srtt_eth1, cf_eth0, cf_eth1,
-        tw_eth0, tw_eth1, cf_total );
+    /* Adjust the congestion factor; smooth variation */
+    *this_cf = 9*(*this_cf) + rtt_diff;
+    *this_cf = (*this_cf * 205) >> 11;
+
+
+    printk(KERN_INFO "[stager][_update_iface_stats] Final stats for iface %d "
+        "[rtt] %d [srtt] %d %d [srtt_min] %d %d [rttd] %d [cf] %d %d\n",
+        iface, rtt_instant, srtt[0], srtt[1], srtt_min[0], srtt_min[1],
+        rtt_diff, cf[0], cf[1]);
 }
 
 
@@ -242,6 +244,8 @@ _get_packet_descriptor(struct sk_buff *skb)
 /* iface can be:
     * 0 -> add the flow to iface_connections_eth0
     * 1 -> add the flow to iface_connections_eth1
+
+    Called from ipip_rcv()
 */
 static void
 add_l4_flow_to_iface(struct sk_buff *skb, int iface)
@@ -332,6 +336,105 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
 }
 
 
+/* Restages the flows along the possible paths.
+ */
+static void
+_do_restage(u16 *ideal_fc)
+{
+    /* empty */
+}
+
+/* We'll restage the flows on all ifaces when both of the following conditions
+    are true (for any of the ifaces):
+        o srtt - (srtt_min) > 0.3 * srtt_min
+        o |last_restage_srtt_val  - srtt| > 0.1 * srtt_min
+
+    Alternative implementation - restage if the following is true:
+        o for any of the ifaces there's a positive fluctuation in the SRTT
+            calculation for a pre-defined number of steps
+
+    Called from ipip_tunnel_xmit() -> get_iface_for_skb()
+*/
+static void
+_stage_flows(void)
+{
+    u8 should_restage = 0;
+    u8 i = 0;
+
+    /* traffic weight, expressed in % of 100 */
+    /* FIXME: remove static initialization from throughout the code */
+    static u16 tw[PATHS_COUNT] = {0, 0};
+
+    /* Establish if we'll need to restage */
+    for (i = 0; i < PATHS_COUNT; ++i)
+    {
+        if ((10*(srtt[i] - (srtt_min[i])) > 3 * srtt_min[i]) &&
+            (10*abs(last_restage_srtt_val[i] - srtt[i]) > 5*srtt_min[i]))
+        {
+            should_restage = 1;
+            printk(KERN_INFO "[stager] Restage for iface: %d\n", i);
+            last_restage_srtt_val[i] = srtt[i];
+            break;
+        }
+    }
+
+    /* Should perform some route calculation then re-staging here */
+    if (should_restage)
+    {
+        int j = 0;
+
+        /* Congestion factor total: sum of cf from all paths */
+        u16 cf_total = 0;
+
+        /* Traffic count total: how many flows are being carried at the moment
+            on all paths.
+         */
+        u16 tc_total;
+
+        /* Ideal flow count: depending on the traffic weight per each path, how
+            many flows should a path carry - relative to the total amount of
+            flows on all paths (tc_total).
+         */
+        u16 ideal_fc[PATHS_COUNT];
+
+        for (j = 0; j < PATHS_COUNT; ++j)
+        {
+            cf_total += cf[j];
+        }
+
+        /* Compute the traffic weight: how much weight is each iface carying atm.
+           The tw (traffic weight) is relative to the congestion factor
+        */
+        if (cf_total != 0){
+            for (j = 0; j < PATHS_COUNT; ++j)
+            {
+                tw[j] = 100 - ((100*(cf[j]))/cf_total);
+            }
+        }
+
+        /* FIXME: how to distribute the flows ? */
+        tc_total = iface_conn_count_eth0 + iface_conn_count_eth1;
+        ideal_fc[0] = (tc_total * tw[0] )/100;
+        ideal_fc[1] = tc_total - ideal_fc[0];
+
+        if (ideal_fc[0] != iface_conn_count_eth0){
+            _do_restage(ideal_fc);
+        }
+
+        printk(KERN_INFO
+            "[stager] tc_total %d fc %d %d tc %d %d tw %d %d; last srtt %d %d\n",
+            tc_total,
+            iface_conn_count_eth0, iface_conn_count_eth1,
+            ideal_fc[0], ideal_fc[1],
+            tw[0], tw[1],
+            last_restage_srtt_val[0], last_restage_srtt_val[1]);
+    }
+}
+
+
+/*
+    Called from ipip_tunnel_xmit()
+*/
 static int
 get_iface_for_skb(struct sk_buff *skb)
 {
@@ -340,10 +443,15 @@ get_iface_for_skb(struct sk_buff *skb)
     __be16 dest_port;
     int i;
 
+#ifdef STAGER_SITE_A
+    _stage_flows();
+#endif
+
     skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
     tcp_header = tcp_hdr(skb);
     source_port = ntohs(tcp_header->source);
     dest_port = ntohs(tcp_header->dest);
+
 
 #ifdef STAGER_SITE_A
     if( (dest_port & 0x01) == 0){
