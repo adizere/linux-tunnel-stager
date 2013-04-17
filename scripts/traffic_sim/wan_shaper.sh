@@ -18,26 +18,24 @@ init_shaper() {
 modify_delay() {
     dev=$1
     delay="$2ms"
+    variation="$(expr $2 / 2)ms";
 
-    tc qdisc change dev $dev root netem delay $delay 20ms 25% loss 7%
+    tc qdisc change dev $dev root netem delay $delay $variation loss 7%
     echo "Delay modified for $dev: ";
     tc qdisc show dev $dev
 }
 
 
 init_shaper;
-
+sleep 5;
 while true ; do
-    sleep 2;
-
     modify_delay 'eth3' 250
+    modify_delay 'eth1' 100
 
-    sleep 10;
+    sleep 20;
 
-    modify_delay 'eth3' 50
+    modify_delay 'eth3' 100
+    modify_delay 'eth1' 250
 
-    sleep 30;
+    sleep 20;
 done
-
-
-

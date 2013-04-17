@@ -2,7 +2,7 @@
 
 RECEIVER="10.0.1.2"
 
-count=2;
+count=16;
 port=5002;
 
 
