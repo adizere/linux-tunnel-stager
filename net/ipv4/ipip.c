@@ -174,7 +174,13 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 {
     const u8 *hash_location; /* we'll ignore this anyway */
     struct tcp_options_received *rx_opt; /* defined in linux/tcp.h */
-    unsigned int rtt_instant, *srtt, *tw, *cf;
+    unsigned int *srtt, *tw, *cf;
+    u32 rtt_instant;
+    struct tcphdr *tcp_header = tcp_hdr(skb);
+
+    /* RST packets should not carry timestamps (rfc1323) */
+    if (tcp_header->rst)
+        return;
 
     printk(KERN_INFO " * _update_iface_stats\n");
 
@@ -194,45 +200,34 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     tcp_parse_options(skb, rx_opt, &hash_location, 0);
 
     /* No need to bother with any updates if we can't compute the RTT */
-    if (rx_opt->rcv_tsecr == 0)
+    if (rx_opt->rcv_tsecr == 0 || rx_opt->rcv_tsecr > tcp_time_stamp)
         return;
 
     printk(KERN_INFO "[_update_iface_stats] Header options: tsval: [%u]; tsecr: [%u]; now: [%u]\n",
         rx_opt->rcv_tsval, rx_opt->rcv_tsecr, tcp_time_stamp);
-    printk(KERN_INFO "-------------\n");
 
     /* Get the last RTT */
     rtt_instant = tcp_time_stamp - rx_opt->rcv_tsecr;
 
     /* Compute the average RTT */
-    if (*srtt == 0) {
-        *srtt = rtt_instant;
-    } else {
-        *srtt = 9*(*srtt) + rtt_instant;
-        printk(KERN_INFO "Intermediary srtt: [%u]\n", *srtt);
-        *srtt = (*srtt * 205) >> 11; /* division by 10, sort of */
-        printk(KERN_INFO "Final srtt: [%u]\n", *srtt);
-    }
+    *srtt = 9*(*srtt) + rtt_instant;
+    *srtt = (*srtt * 205) >> 11; /* division by 10, sort of */
 
     /* Adjust the congestion factor */
     *cf = (rtt_instant > *srtt) ?
         rtt_instant - *srtt :
         0;
-    printk(KERN_INFO "Adjuste congestion factor for current iface: [%u]\n", *cf);
 
     cf_total = cf_eth0 + cf_eth1;
-    printk(KERN_INFO "Congestion factor total: [%u]\n", cf_total);
 
     if (cf_total != 0){
         *tw = 100 - ((100*(*cf))/cf_total);
-        printk(KERN_INFO "Traffic weight resulted to: [%u]\n", *tw);
     }
 
-    printk(KERN_INFO " -- Results: \n");
-    printk(KERN_INFO "rtt_instant: [%d]; srtt: [%d, %d].\n", rtt_instant, srtt_eth0, srtt_eth1);
-    printk(KERN_INFO "traffic weight: [%d, %d].\n", tw_eth0, tw_eth1);
-    printk(KERN_INFO "congestion factor: [%d, %d]; total: [%d].\n", cf_eth0, cf_eth1, cf_total);
-    printk(KERN_INFO "-------------\n");
+    printk(KERN_INFO "[_update_iface_stats] Final stats for iface %d "
+        "rtt: %d srtt: %d %d cf: %d %d tw: %d %d cf_total: %d\n",
+        iface, rtt_instant, srtt_eth0, srtt_eth1, cf_eth0, cf_eth1,
+        tw_eth0, tw_eth1, cf_total );
 }
 
 
@@ -269,7 +264,7 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
 
         _update_iface_stats(skb, iface);
 
-        printk(KERN_INFO "[add_l4_flow_to_iface] Port src: [%u]; dst: [%u]; seq: [%ul]\n",
+        printk(KERN_INFO "[add_l4_flow_to_iface] Port src: [%u]; dst: [%u]; seq: [%u]\n",
             ntohs(tcp_header->source), ntohs(tcp_header->dest), ntohl(tcp_header->seq));
 
         flow_id->src_port = ntohs(tcp_header->source);
@@ -324,7 +319,7 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
             marked_iface[i] = flow_id;
             (*marked_iface_count)++;
 
-            printk(KERN_INFO "[add_l4_flow_to_iface] Added flow id [%d, %d]"
+            printk(KERN_INFO "[add_l4_flow_to_iface] Added flow id [%d, %d] "
                 "to interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
                 iface, *marked_iface_count);
         }
@@ -350,25 +345,26 @@ get_iface_for_skb(struct sk_buff *skb)
     source_port = ntohs(tcp_header->source);
     dest_port = ntohs(tcp_header->dest);
 
-    printk(KERN_INFO "[get_iface_for_skb] with: [%d, %d]\n",
-        source_port, dest_port);
-
-    /* Let's always send the second connection on port 5001 through eth1 */
-    if (dest_port == 5001) {
-        printk(KERN_INFO "*** Watch out: gonna send the traffic for port 5001 through iface 1\n");
+#ifdef STAGER_SITE_A
+    if( (dest_port & 0x01) == 0){
+        printk(KERN_INFO
+            "[get_iface_for_skb] Traffic on port even-number is routed through iface 1\n");
         return 1;
     }
+#endif
 
     for (i = 0; i < iface_conn_count_eth1; ++i)
     {
-        if ((iface_connections_eth1[i]->src_port == source_port) &&
-            (iface_connections_eth1[i]->dst_port == dest_port)){
-            printk(KERN_INFO "[get_iface_for_skb] found flow for [1]\n");
+        if ((iface_connections_eth1[i]->src_port == dest_port) &&
+            (iface_connections_eth1[i]->dst_port == source_port)){
+            printk(KERN_INFO "[get_iface_for_skb] found flow [%d, %d] for [1]\n",
+                source_port, dest_port);
             return 1;
         }
     }
 
-    printk(KERN_INFO "[get_iface_for_skb] flow not found, using [0]\n");
+    printk(KERN_INFO "[get_iface_for_skb] flow [%d, %d] not found in [1], using [0]\n",
+        source_port, dest_port);
     return 0;
 }
 
@@ -451,13 +447,6 @@ static struct ip_tunnel *ipip_tunnel_lookup(struct net *net,
     unsigned int h1 = HASH(local);
     struct ip_tunnel *t;
     struct ipip_net *ipn = net_generic(net, ipip_net_id);
-
-    /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_lookup\n");
-    printk(KERN_INFO "    using ipip_net_id: [%d]\n", ipip_net_id);
-    printk(KERN_INFO "    searching the tunnel associated with remote [%pI4]; local [%pI4]\n",
-        &remote, &local);
-    printk(KERN_INFO "    using hashes: remote [%u]; local [%u]\n", h0, h1);
 
     for_each_ip_tunnel_rcu(ipn->tunnels_r_l[h0 ^ h1])
         if (local == t->parms.iph.saddr &&
@@ -852,10 +841,6 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
         goto tx_error_icmp;
     }
     tdev = rt->dst.dev;
-
-
-    /* stager dev*/
-    printk(KERN_INFO "    egress using device with name: [%s]\n", tdev->name);
 
     if (tdev == dev) {
         ip_rt_put(rt);
