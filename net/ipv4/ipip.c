@@ -151,12 +151,14 @@ struct packet_descriptor {
 };
 
 
-static struct l4_flow *iface_connections_eth0[50];
-static struct l4_flow *iface_connections_eth1[50];
+/*** Stager state variables
+    ***/
 
-static unsigned int iface_conn_count_eth0 = 0;
-static unsigned int iface_conn_count_eth1 = 0;
+/* Which are the flows served on each path */
+static struct l4_flow *path_flows[PATHS_COUNT][50];
 
+/* How many flows each path is serving */
+static u16 path_flows_count[PATHS_COUNT] = {0, 0};
 
 /* smoothed rtt (SRTT) */
 static u16 srtt[PATHS_COUNT] = {0, 0};
@@ -242,8 +244,8 @@ _get_packet_descriptor(struct sk_buff *skb)
 
 
 /* iface can be:
-    * 0 -> add the flow to iface_connections_eth0
-    * 1 -> add the flow to iface_connections_eth1
+    * 0 -> add the flow to path_flows_count[0]
+    * 1 -> add the flow to path_flows_count[1]
 
     Called from ipip_rcv()
 */
@@ -259,7 +261,7 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
     if (_ipheader->protocol == IPPROTO_TCP){
         struct tcphdr *tcp_header = tcp_hdr(skb);
         struct l4_flow *flow_id = NULL;
-        int i, *marked_iface_count, *unmarked_iface_count;
+        u16 i, *marked_iface_count, *unmarked_iface_count;
         struct l4_flow **marked_iface, **unmarked_iface;
 
         flow_id = (struct l4_flow*) kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
@@ -274,18 +276,19 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
         flow_id->src_port = ntohs(tcp_header->source);
         flow_id->dst_port = ntohs(tcp_header->dest);
 
+        /* FIXME: should not assume there are only 2 paths */
         if (iface == 0){
-            rcu_assign_pointer(marked_iface, iface_connections_eth0);
-            rcu_assign_pointer(marked_iface_count, &iface_conn_count_eth0);
+            rcu_assign_pointer(marked_iface, path_flows[0]);
+            rcu_assign_pointer(marked_iface_count, &path_flows_count[0]);
 
-            rcu_assign_pointer(unmarked_iface, iface_connections_eth1);
-            rcu_assign_pointer(unmarked_iface_count, &iface_conn_count_eth1);
+            rcu_assign_pointer(unmarked_iface, path_flows[1]);
+            rcu_assign_pointer(unmarked_iface_count, &path_flows_count[1]);
         } else {
-            rcu_assign_pointer(marked_iface, iface_connections_eth1);
-            rcu_assign_pointer(marked_iface_count, &iface_conn_count_eth1);
+            rcu_assign_pointer(marked_iface, path_flows[1]);
+            rcu_assign_pointer(marked_iface_count, &path_flows_count[1]);
 
-            rcu_assign_pointer(unmarked_iface, iface_connections_eth0);
-            rcu_assign_pointer(unmarked_iface_count, &iface_conn_count_eth0);
+            rcu_assign_pointer(unmarked_iface, path_flows[0]);
+            rcu_assign_pointer(unmarked_iface_count, &path_flows_count[0]);
         }
 
         /* Scoatem flow_id din vectorul cu flowurile corespondente interfetei
@@ -336,13 +339,44 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
 }
 
 
+static void
+_do_flows_switch(u16 count, u16 from, u16 to)
+{
+    /* empty */
+}
+
+
 /* Restages the flows along the possible paths.
+
+    Called from:
+    ipip_tunnel_xmit() -> get_iface_for_skb() -> _stage_flows()
  */
 static void
 _do_restage(u16 *ideal_fc)
 {
-    /* empty */
+    u16 fc_diff, from_iface, to_iface;
+
+    /* iface 0 should ideally have more connections on it */
+    if (ideal_fc[0] > path_flows_count[0]){
+        fc_diff = ideal_fc[0] - path_flows_count[0];
+        printk(KERN_INFO "[stager] Need to move %d flows from eth1 to eth0\n", fc_diff);
+        from_iface = 1;
+        to_iface = 0;
+    } else {
+        fc_diff = ideal_fc[1] - path_flows_count[1];
+        printk(KERN_INFO "[stager] Need to move %d flows from eth0 to eth1\n", fc_diff);
+        from_iface = 0;
+        to_iface = 1;
+    }
+
+    if (fc_diff <= 2){
+        return;
+    }
+
+    fc_diff = fc_diff / 2;
+    _do_flows_switch(fc_diff, from_iface, to_iface);
 }
+
 
 /* We'll restage the flows on all ifaces when both of the following conditions
     are true (for any of the ifaces):
@@ -413,18 +447,18 @@ _stage_flows(void)
         }
 
         /* FIXME: how to distribute the flows ? */
-        tc_total = iface_conn_count_eth0 + iface_conn_count_eth1;
+        tc_total = path_flows_count[0] + path_flows_count[1];
         ideal_fc[0] = (tc_total * tw[0] )/100;
         ideal_fc[1] = tc_total - ideal_fc[0];
 
-        if (ideal_fc[0] != iface_conn_count_eth0){
+        if (ideal_fc[0] != path_flows_count[0]){
             _do_restage(ideal_fc);
         }
 
         printk(KERN_INFO
             "[stager] tc_total %d fc %d %d tc %d %d tw %d %d; last srtt %d %d\n",
             tc_total,
-            iface_conn_count_eth0, iface_conn_count_eth1,
+            path_flows_count[0], path_flows_count[1],
             ideal_fc[0], ideal_fc[1],
             tw[0], tw[1],
             last_restage_srtt_val[0], last_restage_srtt_val[1]);
@@ -461,10 +495,10 @@ get_iface_for_skb(struct sk_buff *skb)
     }
 #endif
 
-    for (i = 0; i < iface_conn_count_eth1; ++i)
+    for (i = 0; i < path_flows_count[1]; ++i)
     {
-        if ((iface_connections_eth1[i]->src_port == dest_port) &&
-            (iface_connections_eth1[i]->dst_port == source_port)){
+        if ((path_flows[1][i]->src_port == dest_port) &&
+            (path_flows[1][i]->dst_port == source_port)){
             printk(KERN_INFO "[get_iface_for_skb] found flow [%d, %d] for [1]\n",
                 source_port, dest_port);
             return 1;
