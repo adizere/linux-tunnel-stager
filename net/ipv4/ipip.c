@@ -534,8 +534,8 @@ get_iface_for_skb(struct sk_buff *skb)
 
 #ifdef STAGER_SITE_A
     /* Temporary fix to have at least 1 flow on eth1 */
-    // if( (dest_port & 0x01) == 0 && (srtt_min[1] == USHRT_MAX) ){
-    if ((dest_port & 0x01) == 0){
+    if( (dest_port & 0x01) == 0 && (srtt_min[1] == USHRT_MAX) ){
+    // if ((dest_port & 0x01) == 0){
         printk(KERN_INFO
             "[get_iface_for_skb] Traffic on port even-number is routed through iface 1\n");
         return 1;
