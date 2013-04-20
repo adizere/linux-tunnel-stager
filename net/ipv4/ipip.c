@@ -243,6 +243,72 @@ _get_packet_descriptor(struct sk_buff *skb)
 }
 
 
+static void
+_do_flow_add(struct l4_flow *flow_id, int iface)
+{
+    u16 i, *marked_iface_count, *unmarked_iface_count;
+    struct l4_flow **marked_iface, **unmarked_iface;
+
+
+    /* FIXME: should not assume there are only 2 paths */
+    if (iface == 0){
+        rcu_assign_pointer(marked_iface, path_flows[0]);
+        rcu_assign_pointer(marked_iface_count, &path_flows_count[0]);
+
+        rcu_assign_pointer(unmarked_iface, path_flows[1]);
+        rcu_assign_pointer(unmarked_iface_count, &path_flows_count[1]);
+    } else {
+        rcu_assign_pointer(marked_iface, path_flows[1]);
+        rcu_assign_pointer(marked_iface_count, &path_flows_count[1]);
+
+        rcu_assign_pointer(unmarked_iface, path_flows[0]);
+        rcu_assign_pointer(unmarked_iface_count, &path_flows_count[0]);
+    }
+
+    /* Scoatem flow_id din vectorul cu flowurile corespondente interfetei
+        unmarked.
+    */
+    for (i = 0; i < *unmarked_iface_count-1; ++i)
+    {
+        if ((unmarked_iface[i]->src_port == flow_id->src_port) &&
+            (unmarked_iface[i]->dst_port == flow_id->dst_port)){
+#ifndef STAGER_SITE_A
+            kfree(unmarked_iface[i]);
+#endif
+
+            unmarked_iface[i] = unmarked_iface[*unmarked_iface_count-1];
+            (*unmarked_iface_count)--;
+            printk(KERN_INFO "[add_l4_flow_to_iface] Removed flow id [%d, %d]"
+                "from interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
+                (iface+1)%2, *unmarked_iface_count);
+            break;
+        }
+    }
+
+    /*
+        Daca flow_id nu e in lista de flowuri din interfata marked atunci
+        il adaugam.
+    */
+    for (i = 0; i < *marked_iface_count; ++i)
+    {
+        if ((marked_iface[i]->src_port == flow_id->src_port) &&
+            (marked_iface[i]->dst_port == flow_id->dst_port)){
+            printk(KERN_INFO "[stager] Found flow id [%d, %d] "
+                "in interface [%d]\n", flow_id->src_port, flow_id->dst_port, iface);
+            break;
+        }
+    }
+    if (i == *marked_iface_count) {
+        marked_iface[i] = flow_id;
+        (*marked_iface_count)++;
+
+        printk(KERN_INFO "[stager] Added flow id [%d, %d] "
+            "to interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
+            iface, *marked_iface_count);
+    }
+}
+
+
 /* iface can be:
     * 0 -> add the flow to path_flows_count[0]
     * 1 -> add the flow to path_flows_count[1]
@@ -261,8 +327,6 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
     if (_ipheader->protocol == IPPROTO_TCP){
         struct tcphdr *tcp_header = tcp_hdr(skb);
         struct l4_flow *flow_id = NULL;
-        u16 i, *marked_iface_count, *unmarked_iface_count;
-        struct l4_flow **marked_iface, **unmarked_iface;
 
         flow_id = (struct l4_flow*) kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
         if (flow_id == NULL)
@@ -276,60 +340,8 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
         flow_id->src_port = ntohs(tcp_header->source);
         flow_id->dst_port = ntohs(tcp_header->dest);
 
-        /* FIXME: should not assume there are only 2 paths */
-        if (iface == 0){
-            rcu_assign_pointer(marked_iface, path_flows[0]);
-            rcu_assign_pointer(marked_iface_count, &path_flows_count[0]);
+        _do_flow_add(flow_id, iface);
 
-            rcu_assign_pointer(unmarked_iface, path_flows[1]);
-            rcu_assign_pointer(unmarked_iface_count, &path_flows_count[1]);
-        } else {
-            rcu_assign_pointer(marked_iface, path_flows[1]);
-            rcu_assign_pointer(marked_iface_count, &path_flows_count[1]);
-
-            rcu_assign_pointer(unmarked_iface, path_flows[0]);
-            rcu_assign_pointer(unmarked_iface_count, &path_flows_count[0]);
-        }
-
-        /* Scoatem flow_id din vectorul cu flowurile corespondente interfetei
-            unmarked
-        */
-        for (i = 0; i < *unmarked_iface_count-1; ++i)
-        {
-            if ((unmarked_iface[i]->src_port == flow_id->src_port) &&
-                (unmarked_iface[i]->dst_port == flow_id->dst_port)){
-                kfree(unmarked_iface[i]);
-
-                unmarked_iface[i] = unmarked_iface[*unmarked_iface_count-1];
-                (*unmarked_iface_count)--;
-                printk(KERN_INFO "[add_l4_flow_to_iface] Removed flow id [%d, %d]"
-                    "from interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
-                    (iface+1)%2, *unmarked_iface_count);
-                break;
-            }
-        }
-
-        /*
-            Daca flow_id nu e in lista de flowuri din interfata marked atunci
-            il adaugam.
-        */
-        for (i = 0; i < *marked_iface_count; ++i)
-        {
-            if ((marked_iface[i]->src_port == flow_id->src_port) &&
-                (marked_iface[i]->dst_port == flow_id->dst_port)){
-                printk(KERN_INFO "[add_l4_flow_to_iface] Found flow id [%d, %d] "
-                    "in interface [%d]\n", flow_id->src_port, flow_id->dst_port, iface);
-                break;
-            }
-        }
-        if (i == *marked_iface_count) {
-            marked_iface[i] = flow_id;
-            (*marked_iface_count)++;
-
-            printk(KERN_INFO "[add_l4_flow_to_iface] Added flow id [%d, %d] "
-                "to interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
-                iface, *marked_iface_count);
-        }
     } else {
         printk(KERN_INFO "[ipip_rcv] Protocol is not TCP\n");
         if (_ipheader->protocol == IPPROTO_ICMP){
@@ -342,7 +354,22 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
 static void
 _do_flows_switch(u16 count, u16 from, u16 to)
 {
-    /* empty */
+    u16 still_switching = count;
+    printk(KERN_INFO "[stager] About to move %d flows from %d to %d\n",
+    count, from, to);
+
+    while(still_switching)
+    {
+        /* We'll identify the flows in the 'from' path and add them to
+            the 'to' path
+        */
+        if (path_flows_count[from] > 1){
+            _do_flow_add(path_flows[from][0], to);
+        } else {
+            still_switching = 0;
+        }
+        still_switching--;
+    }
 }
 
 
@@ -369,11 +396,11 @@ _do_restage(u16 *ideal_fc)
         to_iface = 1;
     }
 
-    if (fc_diff <= 2){
-        return;
-    }
+    // if (fc_diff <= 2){
+    //     return;
+    // }
 
-    fc_diff = fc_diff / 2;
+    // fc_diff = fc_diff / 2;
     _do_flows_switch(fc_diff, from_iface, to_iface);
 }
 
@@ -381,7 +408,7 @@ _do_restage(u16 *ideal_fc)
 /* We'll restage the flows on all ifaces when both of the following conditions
     are true (for any of the ifaces):
         o srtt - (srtt_min) > 0.3 * srtt_min
-        o |last_restage_srtt_val  - srtt| > 0.1 * srtt_min
+        o |last_restage_srtt_val  - srtt| > 0.5 * srtt_min
 
     Alternative implementation - restage if the following is true:
         o for any of the ifaces there's a positive fluctuation in the SRTT
@@ -448,8 +475,15 @@ _stage_flows(void)
 
         /* FIXME: how to distribute the flows ? */
         tc_total = path_flows_count[0] + path_flows_count[1];
+
         ideal_fc[0] = (tc_total * tw[0] )/100;
+        ideal_fc[0] = (ideal_fc[0] > 0) ? ideal_fc[0] : 1;
+
         ideal_fc[1] = tc_total - ideal_fc[0];
+        if ((tc_total > 1) && (ideal_fc[1] == 0)){
+            ideal_fc[1] = 1;
+            ideal_fc[0]--;
+        }
 
         if (ideal_fc[0] != path_flows_count[0]){
             _do_restage(ideal_fc);
@@ -462,6 +496,17 @@ _stage_flows(void)
             ideal_fc[0], ideal_fc[1],
             tw[0], tw[1],
             last_restage_srtt_val[0], last_restage_srtt_val[1]);
+
+        for (j = 0; j < PATHS_COUNT; ++j)
+        {
+            int i;
+            for (i = 0; i < path_flows_count[j]; ++i)
+            {
+                printk(KERN_INFO "[%d, %d]",
+                    path_flows[j][i]->src_port, path_flows[j][i]->dst_port);
+            }
+            printk(KERN_INFO "\n---\n");
+        }
     }
 }
 
@@ -488,7 +533,9 @@ get_iface_for_skb(struct sk_buff *skb)
 
 
 #ifdef STAGER_SITE_A
-    if( (dest_port & 0x01) == 0){
+    /* Temporary fix to have at least 1 flow on eth1 */
+    // if( (dest_port & 0x01) == 0 && (srtt_min[1] == USHRT_MAX) ){
+    if ((dest_port & 0x01) == 0){
         printk(KERN_INFO
             "[get_iface_for_skb] Traffic on port even-number is routed through iface 1\n");
         return 1;
@@ -666,12 +713,14 @@ static void ipip_tunnel_unlink(struct ipip_net *ipn, struct ip_tunnel *t)
     }
 }
 
+
 static void ipip_tunnel_link(struct ipip_net *ipn, struct ip_tunnel *t)
 {
+    struct ip_tunnel __rcu **tp = ipip_bucket(ipn, t);
+
     /* stager dev */
     printk(KERN_INFO "* ipip_tunnel_link\n");
 
-    struct ip_tunnel __rcu **tp = ipip_bucket(ipn, t);
 
     rcu_assign_pointer(t->next, rtnl_dereference(*tp));
     rcu_assign_pointer(*tp, t);
@@ -922,6 +971,7 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
     __be32 dst = tiph->daddr;
     struct flowi4 fl4;
     int    mtu;
+    int i;
 
     /* stager dev */
     __be32 mangle_dst;
@@ -946,7 +996,6 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
 
     /* stager dev */
     /* change the header IP src and dst to be the hardcoded ones */
-    int i;
     if (old_iph->protocol == IPPROTO_TCP){
         i = get_iface_for_skb(skb);
     } else {
@@ -1409,12 +1458,12 @@ err_alloc_dev:
 
 static void __net_exit ipip_exit_net(struct net *net)
 {
+    struct ipip_net *ipn = net_generic(net, ipip_net_id);
+    LIST_HEAD(list);
+
     /* stager dev */
     printk(KERN_INFO "* ipip_exit_net\n");
     printk(KERN_INFO "    net->proc_net->name: [%s]\n", net->proc_net->name);
-
-    struct ipip_net *ipn = net_generic(net, ipip_net_id);
-    LIST_HEAD(list);
 
     rtnl_lock();
     ipip_destroy_tunnels(ipn, &list);

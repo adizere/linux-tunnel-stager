@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Measures how much bandwidth is utilized in each second for a given net if
+# Measures how much bandwidth is utilized in each second for a given net ifvogel1985
 
 dev="eth0";
 steps=1;
@@ -8,6 +8,8 @@ steps=1;
 if [[ $# > 0 ]]; then
 	dev="$1"
 fi
+
+echo " * Watching the bandwidth usage for interface: $dev";
 
 # RX and TX bytes at start time
 rx_last=$(ifconfig $dev | grep bytes | awk '{print $2}' | sed 's/bytes://g' );
