@@ -25,6 +25,8 @@
 #include <netinet/in.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
+
 #define SIZE_OF_CHUNK 1024
 #define MIN_SLEEP_TIME 0.001		// in s.
 
@@ -86,7 +88,7 @@ main(int argc, char **argv) {
 	}
 
 	/* Don't rush it */
-	sleep(1); 
+	usleep(100000); 
 
 	j += ((k=send(sock, chunk, bandwidth%packet_size, 0))>0? k: 0);
 	if (k==-1) perror("error at send: ");

@@ -26,16 +26,28 @@ modify_delay() {
 }
 
 
+modify_bandwidth() {
+    dev=$1
+    bw=$2
+
+    tc qdisc replace dev $dev root tbf rate $bw burst 16KB limit 150KB
+
+    echo "Bandwidth modified for $dev: ";
+    tc qdisc show dev $dev
+}
+
 init_shaper;
 
+
+
 while true ; do
-    modify_delay 'eth3' 400
-    modify_delay 'eth1' 250
+    modify_bandwidth 'eth3' 150Kbit
+    modify_bandwidth 'eth1' 250Kbit
 
     sleep 30;
 
-    modify_delay 'eth3' 250
-    modify_delay 'eth1' 400
+    modify_bandwidth 'eth3' 250Kbit
+    modify_bandwidth 'eth1' 150Kbit
 
     sleep 30;
 done
