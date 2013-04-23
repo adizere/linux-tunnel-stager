@@ -278,12 +278,18 @@ _do_flow_add(struct l4_flow *flow_id, int iface)
             kfree(unmarked_iface[i]);
 #endif
 
-            unmarked_iface[i] = unmarked_iface[*unmarked_iface_count-1];
-            (*unmarked_iface_count)--;
-            printk(KERN_INFO "[add_l4_flow_to_iface] Removed flow id [%d, %d]"
-                "from interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
-                (iface+1)%2, *unmarked_iface_count);
-            break;
+            if (iface == 2){
+                printk(KERN_INFO "[add_l4_flow_to_iface] Removed flow id [%d, %d]"
+                    "from interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
+                    (iface+1)%2, *unmarked_iface_count);
+            } else {
+                unmarked_iface[i] = unmarked_iface[*unmarked_iface_count-1];
+                (*unmarked_iface_count)--;
+                printk(KERN_INFO "[add_l4_flow_to_iface] Removed flow id [%d, %d]"
+                    "from interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
+                    (iface+1)%2, *unmarked_iface_count);
+                break;
+            }
         }
     }
 
@@ -300,13 +306,19 @@ _do_flow_add(struct l4_flow *flow_id, int iface)
             break;
         }
     }
-    if (i == *marked_iface_count) {
-        marked_iface[i] = flow_id;
-        (*marked_iface_count)++;
+    if (iface == 2){
+       printk(KERN_INFO "[stager] Added flow id [%d, %d] "
+                "to interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
+                iface, *marked_iface_count);
+    } else {
+        if (i == *marked_iface_count) {
+            marked_iface[i] = flow_id;
+            (*marked_iface_count)++;
 
-        printk(KERN_INFO "[stager] Added flow id [%d, %d] "
-            "to interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
-            iface, *marked_iface_count);
+            printk(KERN_INFO "[stager] Added flow id [%d, %d] "
+                "to interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
+                iface, *marked_iface_count);
+        }
     }
 }
 
