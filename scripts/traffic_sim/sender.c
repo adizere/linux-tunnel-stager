@@ -88,7 +88,7 @@ main(int argc, char **argv) {
 	}
 
 	/* Don't rush it */
-	usleep(100000); 
+	usleep(1000); 
 
 	j += ((k=send(sock, chunk, bandwidth%packet_size, 0))>0? k: 0);
 	if (k==-1) perror("error at send: ");

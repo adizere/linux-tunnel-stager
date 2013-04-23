@@ -3,16 +3,18 @@
 
 init_shaper() {
     # reset previous settings
+    $(tc qdisc del dev eth0 root 2>/dev/null)
     $(tc qdisc del dev eth1 root 2>/dev/null)
+    $(tc qdisc del dev eth2 root 2>/dev/null)
     $(tc qdisc del dev eth3 root 2>/dev/null)
 
     # delay with a random variation of max 20 ms and 25% correlation
-    tc qdisc add dev eth1 root netem delay 100ms 20ms 25% loss 7%
-    tc qdisc add dev eth3 root netem delay 100ms 20ms 25% loss 7%
+    tc qdisc add dev eth0 root netem delay 50ms 10ms 25%
+    tc qdisc add dev eth2 root netem delay 50ms 10ms 25%
 
-    echo " * Initialized to: ";
-    tc qdisc show dev eth1
-    tc qdisc show dev eth3
+    # echo " * Initialized to: ";
+    tc qdisc show dev eth0
+    tc qdisc show dev eth2
 }
 
 modify_delay() {
@@ -29,11 +31,12 @@ modify_delay() {
 modify_bandwidth() {
     dev=$1
     bw=$2
+    latency=$3
 
-    tc qdisc replace dev $dev root tbf rate $bw burst 16KB limit 150KB
+    tc qdisc replace dev $dev root tbf rate $bw burst 16KB latency $latency
 
     echo "Bandwidth modified for $dev: ";
-    tc qdisc show dev $dev
+    tc -s -d qdisc show dev $dev
 }
 
 init_shaper;
@@ -41,13 +44,13 @@ init_shaper;
 
 
 while true ; do
-    modify_bandwidth 'eth3' 150Kbit
-    modify_bandwidth 'eth1' 250Kbit
+    modify_bandwidth 'eth3' 3500Kbit 120ms
+    modify_bandwidth 'eth1' 2450Kbit 160ms
 
     sleep 30;
 
-    modify_bandwidth 'eth3' 250Kbit
-    modify_bandwidth 'eth1' 150Kbit
+    modify_bandwidth 'eth3' 2450Kbit 160ms
+    modify_bandwidth 'eth1' 3500Kbit 120ms
 
     sleep 30;
 done
