@@ -132,6 +132,8 @@
 /* FIXME:
     * lists with connections count should not be hardcoded
     * lists with connections/conn count should be actively managed
+    * replace list with connections to be a hash table
+    * concurrency control on all global variables with RCU and locks
 */
 #define PATHS_COUNT 2
 
@@ -215,8 +217,8 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     *this_srtt = 9*(*this_srtt) + rtt_instant;
     *this_srtt = (*this_srtt * 205) >> 11; /* division by 10, sort of */
 
-    /* FIXME: we should not depend on this hardcodede value */
-    if (*this_srtt < *this_srtt_min && *this_srtt > 19)
+    /* FIXME: we should not depend on this hardcoded value */
+    if (*this_srtt < *this_srtt_min && *this_srtt > 40)
         *this_srtt_min = *this_srtt;
 
     /* difference between the instant RTT and the smoothed RTT */
@@ -364,6 +366,7 @@ _do_flows_switch(u16 count, u16 from, u16 to)
             the 'to' path
         */
         if (path_flows_count[from] > 1){
+            /* Static route simulation: just put a '2' instead of 'to' */
             _do_flow_add(path_flows[from][0], to);
         } else {
             still_switching = 0;
@@ -535,6 +538,8 @@ get_iface_for_skb(struct sk_buff *skb)
 #ifdef STAGER_SITE_A
     /* Temporary fix to have at least 1 flow on eth1 */
     if( (dest_port & 0x01) == 0 && (srtt_min[1] == USHRT_MAX) ){
+
+    /* Static route simulation: even-numbered ports routed through iface 1 */
     // if ((dest_port & 0x01) == 0){
         printk(KERN_INFO
             "[get_iface_for_skb] Traffic on port even-number is routed through iface 1\n");
