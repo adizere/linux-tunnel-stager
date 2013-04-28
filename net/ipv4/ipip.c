@@ -185,9 +185,9 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 {
     const u8 *hash_location; /* we'll ignore this anyway */
     struct tcp_options_received *rx_opt; /* defined in linux/tcp.h */
-    u16 *this_srtt, *this_srtt_min, *this_cf;
+    u16 *this_srtt, *this_cf;
     u32 rtt_instant;
-    u32 rtt_diff;
+    s32 rtt_diff;
     struct tcphdr *tcp_header = tcp_hdr(skb);
 
     /* RST packets should not carry timestamps (rfc1323) */
@@ -210,24 +210,19 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     rtt_instant = tcp_time_stamp - rx_opt->rcv_tsecr;
 
     rcu_assign_pointer(this_srtt, &srtt[iface]);
-    rcu_assign_pointer(this_srtt_min, &srtt_min[iface]);
     rcu_assign_pointer(this_cf, &cf[iface]);
 
     /* Compute the average RTT */
-    *this_srtt = 9*(*this_srtt) + rtt_instant;
-    *this_srtt = (*this_srtt * 205) >> 11; /* division by 10, sort of */
-
-    /* FIXME: we should not depend on this hardcoded value */
-    if (*this_srtt < *this_srtt_min && *this_srtt > 40)
-        *this_srtt_min = *this_srtt;
+    *this_srtt = 9*(*this_srtt) + 1*rtt_instant;
+    *this_srtt = *this_srtt/10;
 
     /* difference between the instant RTT and the smoothed RTT */
-    rtt_diff = abs(rtt_instant - *this_srtt);
-
+    rtt_diff = (rtt_instant > *this_srtt)? rtt_instant > *this_srtt : 0;
 
     /* Adjust the congestion factor; smooth variation */
-    *this_cf = 9*(*this_cf) + rtt_diff;
-    *this_cf = (*this_cf * 205) >> 11;
+    *this_cf = 9*(*this_cf) + 1*rtt_diff;
+    *this_cf = *this_cf/10;
+
 
 
     printk(KERN_INFO "[stager][_update_iface_stats] Final stats for iface %d "
