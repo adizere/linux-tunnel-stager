@@ -176,6 +176,20 @@ static u16 cf[PATHS_COUNT] = {0, 0};
 
 
 /*
+ * Stager - Window implementation */
+
+/* RTT window */
+static u16 rtt_win[PATHS_COUNT][128];
+
+/* Marks a position inside the rtt_win vector */
+static u16 rtt_win_index[PATHS_COUNT];
+
+/* Marks when rtt_win becomes full and we start overwriting old RTT values */
+static u8 rtt_win_full[PATHS_COUNT] = {0, 0};
+
+
+
+/*
     Should update the RTT average value per iface
 
     Called from ipip_rcv() -> add_l4_flow_to_iface()
@@ -185,7 +199,8 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 {
     const u8 *hash_location; /* we'll ignore this anyway */
     struct tcp_options_received *rx_opt; /* defined in linux/tcp.h */
-    u16 *this_srtt, *this_srtt_min, *this_cf;
+    u16 *this_srtt, *this_srtt_min, *this_cf, **this_rtt_win, *this_rtt_win_index;
+    u8 *this_rtt_win_full;
     u32 rtt_instant;
     s32 rtt_diff;
     struct tcphdr *tcp_header = tcp_hdr(skb);
@@ -193,12 +208,6 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     /* RST packets should not carry timestamps (rfc1323) */
     if (tcp_header->rst)
         return;
-
-    // if ((ntohs(tcp_header->source) != 5002) &&
-    //  (ntohs(tcp_header->source) != 5003))
-    //     return;
-
-    printk(KERN_INFO " * _update_iface_stats\n");
 
     /* Structure in whil we'll keep the TCP Header Options */
     rx_opt = (struct tcp_options_received*)
@@ -216,6 +225,11 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     rcu_assign_pointer(this_srtt, &srtt[iface]);
     rcu_assign_pointer(this_srtt_min, &srtt_min[iface]);
     rcu_assign_pointer(this_cf, &cf[iface]);
+
+    rcu_assign_pointer(this_rtt_win, &rtt_win[iface]);
+    rcu_assign_pointer(this_rtt_win_full, &rtt_win_full[iface]);
+    rcu_assign_pointer(this_rtt_win_index, &rtt_win_index[iface]);
+
 
     /* Compute the average RTT */
     *this_srtt = 95*(*this_srtt) + 5*rtt_instant;
