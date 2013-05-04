@@ -165,6 +165,9 @@ static u16 path_flows_count[PATHS_COUNT] = {0, 0};
 /* smoothed rtt (SRTT) */
 static u16 srtt[PATHS_COUNT] = {0, 0};
 
+/* SRTT remainder */
+static u16 srtt_rest[PATHS_COUNT] = {0, 0};
+
 /* minimum srtt */
 static u16 srtt_min[PATHS_COUNT] = {USHRT_MAX, USHRT_MAX};
 
@@ -173,6 +176,9 @@ static u16 last_restage_srtt_val[PATHS_COUNT] = {USHRT_MAX, USHRT_MAX};
 
 /* congestion factor */
 static u16 cf[PATHS_COUNT] = {0, 0};
+
+
+// static last_ts_switch = 0;
 
 
 /*
@@ -185,7 +191,9 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 {
     const u8 *hash_location; /* we'll ignore this anyway */
     struct tcp_options_received *rx_opt; /* defined in linux/tcp.h */
-    u16 *this_srtt, *this_srtt_min, *this_cf;
+    u16 *this_srtt, *this_srtt_min, *this_cf, **this_rtt_win, *this_rtt_win_index, *this_srtt_rest;
+    u64 temp_srtt;
+    u8 *this_rtt_win_full;
     u32 rtt_instant;
     s32 rtt_diff;
     struct tcphdr *tcp_header = tcp_hdr(skb);
@@ -193,12 +201,6 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     /* RST packets should not carry timestamps (rfc1323) */
     if (tcp_header->rst)
         return;
-
-    // if ((ntohs(tcp_header->source) != 5002) &&
-    //  (ntohs(tcp_header->source) != 5003))
-    //     return;
-
-    printk(KERN_INFO " * _update_iface_stats\n");
 
     /* Structure in whil we'll keep the TCP Header Options */
     rx_opt = (struct tcp_options_received*)
@@ -213,25 +215,40 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     /* Get the last RTT */
     rtt_instant = tcp_time_stamp - rx_opt->rcv_tsecr;
 
+    if (rtt_instant > 250)
+        return;
+
     rcu_assign_pointer(this_srtt, &srtt[iface]);
     rcu_assign_pointer(this_srtt_min, &srtt_min[iface]);
     rcu_assign_pointer(this_cf, &cf[iface]);
+    rcu_assign_pointer(this_srtt_rest, &srtt_rest[iface]);
 
-    /* Compute the average RTT */
-    *this_srtt = 95*(*this_srtt) + 5*rtt_instant;
-    // *this_srtt = (*this_srtt * 205) >> 11; /* division by 10, sort of */
-    *this_srtt = *this_srtt / 100;
+
+    // rcu_assign_pointer(this_rtt_win, &rtt_win[iface]);
+    // rcu_assign_pointer(this_rtt_win_full, &rtt_win_full[iface]);
+    // rcu_assign_pointer(this_rtt_win_index, &rtt_win_index[iface]);
+
+
+    if (*this_srtt == 0){
+        *this_srtt = rtt_instant;
+    } else {
+        /* Compute the average RTT */
+        temp_srtt = 980*(*this_srtt)*1000 + 980*(*this_srtt_rest) + 20*rtt_instant*1000;
+        temp_srtt = temp_srtt / 1000;
+        *this_srtt = temp_srtt / 1000;
+        *this_srtt_rest = temp_srtt % 1000;
+    }
 
     /* FIXME: we should not depend on this hardcoded value */
     if (*this_srtt < *this_srtt_min && *this_srtt > 40)
         *this_srtt_min = *this_srtt;
 
     /* difference between the instant RTT and the smoothed RTT */
-    rtt_diff = rtt_instant - *this_srtt;
-    if (rtt_diff < 0) rtt_diff = 0;
-
-    // rtt_diff = *this_srtt - *this_srtt_min;
+    // rtt_diff = rtt_instant - *this_srtt;
     // if (rtt_diff < 0) rtt_diff = 0;
+
+    rtt_diff = *this_srtt - *this_srtt_min;
+    if (rtt_diff < 0) rtt_diff = 0;
 
     /* Adjust the congestion factor; smooth variation */
     *this_cf = 9*(*this_cf) + 1*rtt_diff;
@@ -239,9 +256,9 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 
 
     printk(KERN_INFO "[stager][_update_iface_stats] Final stats for iface %d "
-        "[rtt] %d [srtt] %d %d [srtt_min] %d %d [rttd] %d [cf] %d %d\n",
+        "[rtt] %d [srtt] %d %d [srtt_min] %d %d [rttd] %d [rest] %d %d\n",
         iface, rtt_instant, srtt[0], srtt[1], srtt_min[0], srtt_min[1],
-        rtt_diff, cf[0], cf[1]);
+        rtt_diff, srtt_rest[0], srtt_rest[1]);
 }
 
 
@@ -376,7 +393,7 @@ _do_flows_switch(u16 count, u16 from, u16 to)
         */
         if (path_flows_count[from] > 1){
             /* Static route simulation: just put a '2' instead of 'to' */
-            _do_flow_add(path_flows[from][0], 2);
+            _do_flow_add(path_flows[from][0], to);
         } else {
             still_switching = 0;
         }
@@ -441,10 +458,20 @@ _stage_flows(void)
     /* Establish if we'll need to restage */
     for (i = 0; i < PATHS_COUNT; ++i)
     {
-        if ((10*(srtt[i] - (srtt_min[i])) > 3*srtt_min[i]) &&
+        if ((10*(srtt[i] - (srtt_min[i])) > 5*srtt_min[i]) &&
             (10*abs(last_restage_srtt_val[i] - srtt[i]) > 5*srtt_min[i]))
         {
+            // if (last_ts_switch == 0){
+            //     last_ts_switch = tcp_time_stamp;
+            //     should_restage = 1;
+            // } else {
+            //     if (tcp_time_stamp - last_ts_switch > 1000) {
+            //         last_ts_switch = tcp_time_stamp;
+            //         should_restage = 1;
+            //     }
+            // }
             should_restage = 1;
+
             printk(KERN_INFO "[stager] Restage for iface: %d\n", i);
             last_restage_srtt_val[i] = srtt[i];
             break;
@@ -455,6 +482,7 @@ _stage_flows(void)
     if (should_restage)
     {
         int j = 0;
+        int rest = 0;
 
         /* Congestion factor total: sum of cf from all paths */
         u16 cf_total = 0;
@@ -491,6 +519,10 @@ _stage_flows(void)
         ideal_fc[0] = (tc_total * tw[0] )/100;
         ideal_fc[0] = (ideal_fc[0] > 0) ? ideal_fc[0] : 1;
 
+        rest = (tc_total*tw[0]) % 100;
+        if (rest >= 50)
+            ideal_fc[0]++;
+
         ideal_fc[1] = tc_total - ideal_fc[0];
         if ((tc_total > 1) && (ideal_fc[1] == 0)){
             ideal_fc[1] = 1;
@@ -508,17 +540,6 @@ _stage_flows(void)
             ideal_fc[0], ideal_fc[1],
             tw[0], tw[1],
             last_restage_srtt_val[0], last_restage_srtt_val[1]);
-
-        for (j = 0; j < PATHS_COUNT; ++j)
-        {
-            int i;
-            for (i = 0; i < path_flows_count[j]; ++i)
-            {
-                printk(KERN_INFO "[%d, %d]",
-                    path_flows[j][i]->src_port, path_flows[j][i]->dst_port);
-            }
-            printk(KERN_INFO "\n---\n");
-        }
     }
 }
 
@@ -546,10 +567,10 @@ get_iface_for_skb(struct sk_buff *skb)
 
 #ifdef STAGER_SITE_A
     /* Temporary fix to have at least 1 flow on eth1 */
-    // if( (dest_port & 0x01) == 0 && (srtt_min[1] == USHRT_MAX) ){
+    if( (dest_port & 0x01) == 0 && (srtt_min[1] == USHRT_MAX) ){
 
     /* Static route simulation: even-numbered ports routed through iface 1 */
-    if ((dest_port & 0x01) == 0){
+    // if ((dest_port & 0x01) == 0){
         printk(KERN_INFO
             "[get_iface_for_skb] Traffic on port even-number [%d] is routed through iface 1.\n",
                 dest_port);

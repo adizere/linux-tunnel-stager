@@ -9,8 +9,8 @@ init_shaper() {
     $(tc qdisc del dev eth3 root 2>/dev/null)
 
     # delay with a random variation of max 20 ms and 25% correlation
-    tc qdisc add dev eth0 root netem delay 50ms 10ms 25%
-    tc qdisc add dev eth2 root netem delay 50ms 10ms 25%
+    tc qdisc add dev eth0 root netem delay 40ms
+    tc qdisc add dev eth2 root netem delay 40ms
 
     # echo " * Initialized to: ";
     tc qdisc show dev eth0
@@ -47,10 +47,10 @@ while true ; do
     modify_bandwidth 'eth3' 3500Kbit 120ms
     modify_bandwidth 'eth1' 2450Kbit 160ms
 
-    sleep 30;
+    sleep 40;
 
     modify_bandwidth 'eth3' 2450Kbit 160ms
     modify_bandwidth 'eth1' 3500Kbit 120ms
 
-    sleep 30;
+    sleep 40;
 done
