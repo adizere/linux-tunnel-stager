@@ -111,8 +111,10 @@
 /* stager dev - need the following header for in_aton() */
 #include <linux/inet.h>
 #include <net/tcp.h> /* for tcp_parse_options() */
+#include "uthash.h"
 /* FIXME: move all stager-related code to a separate source */
 // #include "ipip_stager.h"
+#include <linux/spinlock.h>
 
 
 #include <net/sock.h>
@@ -142,19 +144,44 @@ struct l4_flow {
     __u16 dst_port;
 };
 
-/* Packet descriptor: FIXME not used yet */
-struct packet_descriptor {
-    __be32 id;
+
+/* Structure used to uniquely identify a flow based on packet header options */
+struct pkt_keys {
+    u16 src_port;
+    u16 dst_port;
+    u32 src_ip;
+    u32 dst_ip;
+};
+
+
+/* Holds the defining properties of a L4 packet */
+struct pkt_descriptor {
+    u8 path_id; /* Paths begin with 0 */
+
+    /* 4 fields should ensure uniqueness [8 bytes] */
+    struct pkt_keys keys;
 
     enum {
         STAGER_PACKET_TYPE_STICKY = 1,
         STAGER_PACKET_TYPE_ELASTIC = 0,
     } type:1;
+
+    UT_hash_handle hh;
 };
 
+#define HASH_KEYS_LENGTH sizeof(struct pkt_keys)
+
+static DEFINE_SPINLOCK(lock_restage_flag);
+
+#define RESTAGE_FLAG_UNSET      0
+#define RESTAGE_FLAG_SET        1
+#define RESTAGE_FLAG_PENDING    2
 
 /*** Stager state variables
     ***/
+
+/* Flows are kept in a hash list */
+struct pkt_descriptor *egress_flows = NULL;
 
 /* Which are the flows served on each path */
 static struct l4_flow *path_flows[PATHS_COUNT][50];
@@ -174,11 +201,76 @@ static u16 last_restage_srtt_val[PATHS_COUNT] = {USHRT_MAX, USHRT_MAX};
 /* congestion factor */
 static u16 cf[PATHS_COUNT] = {0, 0};
 
+/* flags if restage should be done */
+static u8 restage_flag = RESTAGE_FLAG_UNSET;
+
+
+
+/*
+    Returns:
+        * true if the flows should be restaged
+        * false otherwise
+
+    Various policies can be used to determine if the flows should be restaged.
+    Current policy:
+        * restage the flows on all ifaces when both of the following conditions
+        are true (for any of the ifaces):
+            o srtt - (srtt_min) > 0.3 * srtt_min
+            o |last_restage_srtt_val  - srtt| > 0.5 * srtt_min
+
+    Alternative implementation:
+        * restage if the following is true:
+        o for any of the ifaces there's a positive fluctuation in the SRTT
+            calculation for a pre-defined number of steps
+*/
+static void
+_compute_restage_requirement(void)
+{
+    u8 i = 0;
+    bool should_restage = false;
+
+    /* Establish if we'll need to restage */
+    for (i = 0; i < PATHS_COUNT; ++i)
+    {
+        u16 cu_srtt, cu_srtt_min, cu_last_srtt;
+
+        rcu_read_lock();
+        cu_srtt = *rcu_dereference(srtt);
+        cu_srtt_min = *rcu_dereference(srtt_min);
+        cu_last_srtt = *rcu_dereference(last_restage_srtt_val);
+
+        if ((10*(cu_srtt - cu_srtt_min) > 3*cu_srtt_min) &&
+            (10*abs(cu_last_srtt - cu_srtt) > 5*cu_srtt_min))
+        {
+            rcu_read_unlock();
+            printk(KERN_INFO "[stager] Restage for iface: %d\n", i);
+            /* FIXME: place a write lock here */
+            last_restage_srtt_val[i] = srtt[i];
+            should_restage = true;
+            break;
+        } else {
+            rcu_read_unlock();
+        }
+    }
+
+    if (should_restage == false)
+        return;
+
+    spin_lock(&lock_restage_flag);
+    if (restage_flag == RESTAGE_FLAG_UNSET)
+    {
+        restage_flag = RESTAGE_FLAG_SET;
+        spin_unlock(&lock_restage_flag);
+    } else {
+        spin_unlock(&lock_restage_flag);
+    }
+}
+
 
 /*
     Should update the RTT average value per iface
 
-    Called from ipip_rcv() -> add_l4_flow_to_iface()
+    Called from ipip_rcv() -> update_path_conditions()
 */
 static void
 _update_iface_stats(struct sk_buff *skb, int iface)
@@ -237,11 +329,48 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 }
 
 
-static struct l4_flow*
-_get_packet_descriptor(struct sk_buff *skb)
+static void
+// static struct l4_flow*
+// _get_pkt_descriptor(struct sk_buff *skb)
+_get_pkt_descriptor(int src)
 {
+    struct pkt_descriptor *first = NULL;
+    struct pkt_descriptor *tmp = NULL;
+    struct pkt_keys lookup_keys;
 
-    return NULL;
+    u8 keylen = HASH_KEYS_LENGTH;
+
+    lookup_keys.src_port = src;
+    lookup_keys.dst_port = 10;
+    lookup_keys.src_ip = in_aton("192.168.0.2");
+    lookup_keys.dst_ip = in_aton("192.168.3.2");
+    HASH_FIND(hh, egress_flows, &lookup_keys, HASH_KEYS_LENGTH, first);
+
+    if (first) {
+        printk("Found for %d\n", src);
+    } else {
+        first = (struct pkt_descriptor*)
+            kmalloc(sizeof(struct pkt_descriptor), GFP_ATOMIC);
+
+        first->keys.src_port = src;
+        first->keys.dst_port = 10;
+        first->keys.src_ip = in_aton("192.168.0.2");
+        first->keys.dst_ip = in_aton("192.168.3.2");
+
+        HASH_ADD(hh, egress_flows, keys, HASH_KEYS_LENGTH, first);
+
+        HASH_FIND(hh, egress_flows, &first->keys, HASH_KEYS_LENGTH, tmp);
+        if (tmp)
+            printk("Hell yeah\n");
+    }
+
+    first = NULL;
+
+    HASH_ITER(hh, egress_flows, first, tmp) {
+        printk("Current ports: [%d, %d]\n", first->keys.src_port, first->keys.dst_port);
+    }
+
+    return;
 }
 
 
@@ -280,7 +409,7 @@ _do_flow_add(struct l4_flow *flow_id, int iface)
 
             unmarked_iface[i] = unmarked_iface[*unmarked_iface_count-1];
             (*unmarked_iface_count)--;
-            printk(KERN_INFO "[add_l4_flow_to_iface] Removed flow id [%d, %d]"
+            printk(KERN_INFO "[_do_flow_add] Removed flow id [%d, %d]"
                 "from interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
                 (iface+1)%2, *unmarked_iface_count);
             break;
@@ -318,36 +447,30 @@ _do_flow_add(struct l4_flow *flow_id, int iface)
     Called from ipip_rcv()
 */
 static void
-add_l4_flow_to_iface(struct sk_buff *skb, int iface)
+update_path_conditions(struct sk_buff *skb, int iface)
 {
     struct iphdr *_ipheader = ip_hdr(skb);
 
-    printk(KERN_INFO " * add_l4_flow_to_iface\n");
+    printk(KERN_INFO " * update_path_conditions\n");
 
     skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
 
     if (_ipheader->protocol == IPPROTO_TCP){
-        struct tcphdr *tcp_header = tcp_hdr(skb);
-        struct l4_flow *flow_id = NULL;
-
-        flow_id = (struct l4_flow*) kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
-        if (flow_id == NULL)
-            return;
-
         _update_iface_stats(skb, iface);
 
-        printk(KERN_INFO "[add_l4_flow_to_iface] Port src: [%u]; dst: [%u]; seq: [%u]\n",
-            ntohs(tcp_header->source), ntohs(tcp_header->dest), ntohl(tcp_header->seq));
-
-        flow_id->src_port = ntohs(tcp_header->source);
-        flow_id->dst_port = ntohs(tcp_header->dest);
-
-        _do_flow_add(flow_id, iface);
+        spin_lock(&lock_restage_flag);
+        if (restage_flag == RESTAGE_FLAG_UNSET)
+        {
+            spin_unlock(&lock_restage_flag);
+            _compute_restage_requirement();
+        } else {
+            spin_unlock(&lock_restage_flag);
+        }
 
     } else {
-        printk(KERN_INFO "[ipip_rcv] Protocol is not TCP\n");
+        printk(KERN_INFO "[update_path_conditions] Protocol is not TCP\n");
         if (_ipheader->protocol == IPPROTO_ICMP){
-            printk(KERN_INFO "[ipip_rcv] Protocol is ICMP\n");
+            printk(KERN_INFO "[update_path_conditions] Protocol is ICMP\n");
         }
     }
 }
@@ -379,7 +502,7 @@ _do_flows_switch(u16 count, u16 from, u16 to)
 /* Restages the flows along the possible paths.
 
     Called from:
-    ipip_tunnel_xmit() -> get_iface_for_skb() -> _stage_flows()
+    ipip_tunnel_xmit() -> get_egress_path() -> _stage_flows()
  */
 static void
 _do_restage(u16 *ideal_fc)
@@ -408,42 +531,19 @@ _do_restage(u16 *ideal_fc)
 }
 
 
-/* We'll restage the flows on all ifaces when both of the following conditions
-    are true (for any of the ifaces):
-        o srtt - (srtt_min) > 0.3 * srtt_min
-        o |last_restage_srtt_val  - srtt| > 0.5 * srtt_min
-
-    Alternative implementation - restage if the following is true:
-        o for any of the ifaces there's a positive fluctuation in the SRTT
-            calculation for a pre-defined number of steps
-
-    Called from ipip_tunnel_xmit() -> get_iface_for_skb()
+/*
+    Effectively restages flows.
+    Called from ipip_tunnel_xmit() -> get_egress_path()
 */
 static void
 _stage_flows(void)
 {
-    u8 should_restage = 0;
-    u8 i = 0;
-
     /* traffic weight, expressed in % of 100 */
     /* FIXME: remove static initialization from throughout the code */
     static u16 tw[PATHS_COUNT] = {0, 0};
 
-    /* Establish if we'll need to restage */
-    for (i = 0; i < PATHS_COUNT; ++i)
-    {
-        if ((10*(srtt[i] - (srtt_min[i])) > 3 * srtt_min[i]) &&
-            (10*abs(last_restage_srtt_val[i] - srtt[i]) > 5*srtt_min[i]))
-        {
-            should_restage = 1;
-            printk(KERN_INFO "[stager] Restage for iface: %d\n", i);
-            last_restage_srtt_val[i] = srtt[i];
-            break;
-        }
-    }
-
     /* Should perform some route calculation then re-staging here */
-    if (should_restage)
+    if (1)
     {
         int j = 0;
 
@@ -518,46 +618,45 @@ _stage_flows(void)
     Called from ipip_tunnel_xmit()
 */
 static int
-get_iface_for_skb(struct sk_buff *skb)
+get_egress_path(struct sk_buff *skb)
 {
     struct tcphdr *tcp_header;
     __be16 source_port;
     __be16 dest_port;
     int i;
 
-#ifdef STAGER_SITE_A
-    _stage_flows();
-#endif
+
+    spin_lock(&lock_restage_flag);
+    if (restage_flag == RESTAGE_FLAG_SET)
+    {
+        restage_flag = RESTAGE_FLAG_PENDING;
+        spin_unlock(&lock_restage_flag);
+
+        _stage_flows();
+
+        spin_lock(&lock_restage_flag);
+        restage_flag = RESTAGE_FLAG_UNSET;
+        spin_unlock(&lock_restage_flag);
+    } else {
+        spin_unlock(&lock_restage_flag);
+    }
 
     skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
     tcp_header = tcp_hdr(skb);
     source_port = ntohs(tcp_header->source);
     dest_port = ntohs(tcp_header->dest);
 
-
-#ifdef STAGER_SITE_A
-    /* Temporary fix to have at least 1 flow on eth1 */
-    if( (dest_port & 0x01) == 0 && (srtt_min[1] == USHRT_MAX) ){
-
-    /* Static route simulation: even-numbered ports routed through iface 1 */
-    // if ((dest_port & 0x01) == 0){
-        printk(KERN_INFO
-            "[get_iface_for_skb] Traffic on port even-number is routed through iface 1\n");
-        return 1;
-    }
-#endif
-
     for (i = 0; i < path_flows_count[1]; ++i)
     {
         if ((path_flows[1][i]->src_port == dest_port) &&
             (path_flows[1][i]->dst_port == source_port)){
-            printk(KERN_INFO "[get_iface_for_skb] found flow [%d, %d] for [1]\n",
+            printk(KERN_INFO "[get_egress_path] found flow [%d, %d] for [1]\n",
                 source_port, dest_port);
             return 1;
         }
     }
 
-    printk(KERN_INFO "[get_iface_for_skb] flow [%d, %d] not found in [1], using [0]\n",
+    printk(KERN_INFO "[get_egress_path] flow [%d, %d] not found in [1], using [0]\n",
         source_port, dest_port);
     return 0;
 }
@@ -935,9 +1034,9 @@ static int ipip_rcv(struct sk_buff *skb)
             &iph->saddr, &iph->daddr, &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr);
         if ((in_aton("192.168.0.2") == iph->daddr) ||
             (in_aton("192.168.1.2") == iph->daddr)) {
-            add_l4_flow_to_iface(skb, 0);
+            update_path_conditions(skb, 0);
         } else {
-            add_l4_flow_to_iface(skb, 1);
+            update_path_conditions(skb, 1);
         }
 
         __skb_tunnel_rx(skb, tunnel->dev);
@@ -1002,7 +1101,7 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
     /* stager dev */
     /* change the header IP src and dst to be the hardcoded ones */
     if (old_iph->protocol == IPPROTO_TCP){
-        i = get_iface_for_skb(skb);
+        i = get_egress_path(skb);
     } else {
         printk(KERN_INFO "[ipip_tunnel_xmit] Not a TCP flow. Using default iface [0]\n");
         i = 0;
@@ -1492,6 +1591,19 @@ static int __init ipip_init(void)
     printk(KERN_INFO "* ipip_init\n");
 
     printk(banner);
+
+    _get_pkt_descriptor(4);
+    printk("--\n");
+    _get_pkt_descriptor(5);
+    printk("--\n");
+    _get_pkt_descriptor(6);
+    printk("--\n");
+    _get_pkt_descriptor(7);
+    printk("--\n");
+    _get_pkt_descriptor(8);
+    printk("--\n");
+    _get_pkt_descriptor(5);
+    printk("--\n");
 
     err = register_pernet_device(&ipip_net_ops);
     if (err < 0)
