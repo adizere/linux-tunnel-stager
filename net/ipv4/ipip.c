@@ -281,14 +281,14 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
     if (iface >= 2) return;
 
     /* Sequential search; check if we've already seen this flow */
-    rcu_read_lock();
+    rcu_read_lock_bh();
     list_for_each_entry_rcu(p, &flows_head, flows_list)
     {
 
         u8 switched = 0;
         struct l4_flow *u_flow;
 
-        spin_lock(&lock_update_flow);
+        spin_lock_bh(&lock_update_flow);
         if ((p->src_port == isrc_port) && (p->dst_port == idst_port))
         {
             __u32 delta_time =
@@ -317,32 +317,32 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
                 switched = 1;
             }
             list_replace_rcu(&p->flows_list, &u_flow->flows_list);
-            spin_unlock(&lock_update_flow);
-            synchronize_rcu();
-            kfree(p);
+            spin_unlock_bh(&lock_update_flow);
+            // call_rcu_bh(); /* HOW??? */
+            // kfree(p);
 
             /* Update the counter for flows per path */
             if (switched)
             {
-                spin_lock(&lock_path_flows_count);
+                spin_lock_bh(&lock_path_flows_count);
                 path_flows_count[1-iface]--;
                 path_flows_count[iface]++;
-                spin_unlock(&lock_path_flows_count);
+                spin_unlock_bh(&lock_path_flows_count);
             }
 
             break;
         } else {
-            spin_unlock(&lock_update_flow);
+            spin_unlock_bh(&lock_update_flow);
         }
     }
-    rcu_read_unlock();
+    rcu_read_unlock_bh();
 
     /* Fresh new flow, allocate and add it to our list */
     if (found == 0)
     {
         struct l4_flow *flow_id;
 
-        spin_lock(&lock_add_flow);
+        spin_lock_bh(&lock_add_flow);
         flow_id = kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
 
         flow_id->src_port = isrc_port;
@@ -352,11 +352,11 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
         flow_id->last_jiffies = tcp_time_stamp;
 
         list_add_rcu(&flow_id->flows_list, &flows_head);
-        spin_unlock(&lock_add_flow);
+        spin_unlock_bh(&lock_add_flow);
 
-        spin_lock(&lock_path_flows_count);
+        spin_lock_bh(&lock_path_flows_count);
         path_flows_count[iface]++;
-        spin_unlock(&lock_path_flows_count);
+        spin_unlock_bh(&lock_path_flows_count);
     }
 
     if (report_timestamp != 0)
@@ -420,7 +420,7 @@ _do_flows_switch(u16 count, u16 from, u16 to)
 
         struct l4_flow *u_flow;
 
-        spin_lock(&lock_update_flow);
+        spin_lock_irq(&lock_update_flow);
         if (p->path_id == from)
         {
             still_switching--;
@@ -431,21 +431,21 @@ _do_flows_switch(u16 count, u16 from, u16 to)
             u_flow->path_id = to;
 
             list_replace_rcu(&p->flows_list, &u_flow->flows_list);
-            spin_unlock(&lock_update_flow);
+            spin_unlock_irq(&lock_update_flow);
             synchronize_rcu();
             kfree(p);
 
             /* Update the counter for flows per path */
-            spin_lock(&lock_path_flows_count);
+            spin_lock_irq(&lock_path_flows_count);
             path_flows_count[from]--;
             path_flows_count[to]++;
-            spin_unlock(&lock_path_flows_count);
+            spin_unlock_irq(&lock_path_flows_count);
 
             if (still_switching == 0)
                 break;
 
         } else {
-            spin_unlock(&lock_update_flow);
+            spin_unlock_irq(&lock_update_flow);
         }
     }
     rcu_read_unlock();
@@ -463,16 +463,16 @@ _do_restage(u16 *ideal_fc)
     u16 fc_diff, from_iface, to_iface;
 
     /* iface 0 should ideally have more connections on it */
-    spin_lock(&lock_path_flows_count);
+    spin_lock_irq(&lock_path_flows_count);
     if (ideal_fc[0] > path_flows_count[0]){
         fc_diff = ideal_fc[0] - path_flows_count[0];
-        spin_unlock(&lock_path_flows_count);
+        spin_unlock_irq(&lock_path_flows_count);
         printk(KERN_INFO "[stager] Need to move %d flows from eth1 to eth0\n", fc_diff);
         from_iface = 1;
         to_iface = 0;
     } else {
         fc_diff = ideal_fc[1] - path_flows_count[1];
-        spin_unlock(&lock_path_flows_count);
+        spin_unlock_irq(&lock_path_flows_count);
         printk(KERN_INFO "[stager] Need to move %d flows from eth0 to eth1\n", fc_diff);
         from_iface = 0;
         to_iface = 1;
@@ -567,9 +567,9 @@ _stage_flows(void)
         }
 
         /* FIXME: how to distribute the flows ? */
-        spin_lock(&lock_path_flows_count);
+        spin_lock_irq(&lock_path_flows_count);
         tc_total = path_flows_count[0] + path_flows_count[1];
-        spin_unlock(&lock_path_flows_count);
+        spin_unlock_irq(&lock_path_flows_count);
 
         ideal_fc[0] = (tc_total * tw[0] )/100;
         ideal_fc[0] = (ideal_fc[0] > 0) ? ideal_fc[0] : 1;
