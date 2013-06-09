@@ -140,6 +140,7 @@
     * concurrency control on all global variables with RCU and locks
 */
 #define PATHS_COUNT 2
+#define TRACKER_INTERVAL 950
 
 static DEFINE_SPINLOCK(lock_path_flows_count);
 static DEFINE_SPINLOCK(lock_update_flow);
@@ -300,7 +301,7 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
             *u_flow = *p;
 
 
-            if (delta_time > 900)
+            if (delta_time > TRACKER_INTERVAL)
             {
                 report_timestamp = p->last_jiffies;
                 report_bytes = p->bytes + ibytes;
@@ -360,7 +361,8 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
     }
 
     if (report_timestamp != 0)
-        printk(KERN_INFO "[stager][tracker][%u] Bytes: %u\n",
+        printk(KERN_INFO "[stager][tracker][%u>%u][%u] Bytes: %u\n",
+                    isrc_port, idst_port,
                     report_timestamp, report_bytes);
 }
 
@@ -420,7 +422,7 @@ _do_flows_switch(u16 count, u16 from, u16 to)
 
         struct l4_flow *u_flow;
 
-        spin_lock_irq(&lock_update_flow);
+        spin_lock_bh(&lock_update_flow);
         if (p->path_id == from)
         {
             still_switching--;
@@ -431,21 +433,21 @@ _do_flows_switch(u16 count, u16 from, u16 to)
             u_flow->path_id = to;
 
             list_replace_rcu(&p->flows_list, &u_flow->flows_list);
-            spin_unlock_irq(&lock_update_flow);
+            spin_unlock_bh(&lock_update_flow);
             synchronize_rcu();
             kfree(p);
 
             /* Update the counter for flows per path */
-            spin_lock_irq(&lock_path_flows_count);
+            spin_lock_bh(&lock_path_flows_count);
             path_flows_count[from]--;
             path_flows_count[to]++;
-            spin_unlock_irq(&lock_path_flows_count);
+            spin_unlock_bh(&lock_path_flows_count);
 
             if (still_switching == 0)
                 break;
 
         } else {
-            spin_unlock_irq(&lock_update_flow);
+            spin_unlock_bh(&lock_update_flow);
         }
     }
     rcu_read_unlock();
@@ -463,16 +465,16 @@ _do_restage(u16 *ideal_fc)
     u16 fc_diff, from_iface, to_iface;
 
     /* iface 0 should ideally have more connections on it */
-    spin_lock_irq(&lock_path_flows_count);
+    spin_lock_bh(&lock_path_flows_count);
     if (ideal_fc[0] > path_flows_count[0]){
         fc_diff = ideal_fc[0] - path_flows_count[0];
-        spin_unlock_irq(&lock_path_flows_count);
+        spin_unlock_bh(&lock_path_flows_count);
         printk(KERN_INFO "[stager] Need to move %d flows from eth1 to eth0\n", fc_diff);
         from_iface = 1;
         to_iface = 0;
     } else {
         fc_diff = ideal_fc[1] - path_flows_count[1];
-        spin_unlock_irq(&lock_path_flows_count);
+        spin_unlock_bh(&lock_path_flows_count);
         printk(KERN_INFO "[stager] Need to move %d flows from eth0 to eth1\n", fc_diff);
         from_iface = 0;
         to_iface = 1;
@@ -567,9 +569,9 @@ _stage_flows(void)
         }
 
         /* FIXME: how to distribute the flows ? */
-        spin_lock_irq(&lock_path_flows_count);
+        spin_lock_bh(&lock_path_flows_count);
         tc_total = path_flows_count[0] + path_flows_count[1];
-        spin_unlock_irq(&lock_path_flows_count);
+        spin_unlock_bh(&lock_path_flows_count);
 
         ideal_fc[0] = (tc_total * tw[0] )/100;
         ideal_fc[0] = (ideal_fc[0] > 0) ? ideal_fc[0] : 1;
