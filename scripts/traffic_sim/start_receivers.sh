@@ -1,6 +1,6 @@
 #!/bin/bash
 
-count=16;
+count=64;
 port=5002;
 
 while [[ $count > 0 ]]; do

@@ -140,7 +140,7 @@
     * concurrency control on all global variables with RCU and locks
 */
 #define PATHS_COUNT 2
-#define TRACKER_INTERVAL 950
+#define TRACKER_INTERVAL 1950
 
 static DEFINE_SPINLOCK(lock_path_flows_count);
 static DEFINE_SPINLOCK(lock_update_flow);
@@ -154,6 +154,11 @@ struct l4_flow {
     __be32 bytes;
     u8 path_id;
     struct list_head flows_list;
+};
+
+struct old_l4_flow {
+    struct l4_flow *old_flow;
+    struct rcu_head rcu;
 };
 
 /* Packet descriptor: FIXME not used yet */
@@ -191,8 +196,6 @@ static u16 last_restage_srtt_val[PATHS_COUNT] = {USHRT_MAX, USHRT_MAX};
 /* congestion factor */
 static u16 cf[PATHS_COUNT] = {0, 0};
 
-
-// static last_ts_switch = 0;
 
 
 /*
@@ -241,7 +244,7 @@ _update_iface_stats(struct sk_buff *skb, int iface)
         *this_srtt = rtt_instant;
     } else {
         /* Compute the average RTT */
-        temp_srtt = 980*(*this_srtt)*1000 + 980*(*this_srtt_rest) + 20*rtt_instant*1000;
+        temp_srtt = 975*(*this_srtt)*1000 + 975*(*this_srtt_rest) + 25*rtt_instant*1000;
         temp_srtt = temp_srtt / 1000;
         *this_srtt = temp_srtt / 1000;
         *this_srtt_rest = temp_srtt % 1000;
@@ -271,11 +274,20 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 
 
 static void
+flow_reclaim(struct rcu_head *rp)
+{
+    struct old_l4_flow *fp = container_of(rp, struct old_l4_flow, rcu);
+
+    kfree(fp->old_flow);
+    kfree(fp);
+}
+
+static void
 _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
 {
     u8 found = 0;
     struct l4_flow *p;
-    __u32 report_timestamp = 0;
+    __u32 report_timestamp = 0, delta_time = 0;
     __be32 report_bytes = 0;
 
 
@@ -288,11 +300,12 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
 
         u8 switched = 0;
         struct l4_flow *u_flow;
+        struct old_l4_flow *rel_flow;
 
         spin_lock_bh(&lock_update_flow);
         if ((p->src_port == isrc_port) && (p->dst_port == idst_port))
         {
-            __u32 delta_time =
+            delta_time =
                 jiffies_to_msecs(tcp_time_stamp - p->last_jiffies);
 
             found = 1;
@@ -300,6 +313,8 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
             u_flow = kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
             *u_flow = *p;
 
+            rel_flow = kmalloc(sizeof(struct old_l4_flow), GFP_ATOMIC);
+            rel_flow->old_flow = p;
 
             if (delta_time > TRACKER_INTERVAL)
             {
@@ -319,8 +334,7 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
             }
             list_replace_rcu(&p->flows_list, &u_flow->flows_list);
             spin_unlock_bh(&lock_update_flow);
-            // call_rcu_bh(); /* HOW??? */
-            // kfree(p);
+            call_rcu_bh(&rel_flow->rcu, flow_reclaim);
 
             /* Update the counter for flows per path */
             if (switched)
@@ -360,10 +374,13 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
         spin_unlock_bh(&lock_path_flows_count);
     }
 
-    if (report_timestamp != 0)
-        printk(KERN_INFO "[stager][tracker][%u>%u][%u] Bytes: %u\n",
+#ifndef STAGER_SITE_A
+    if (report_timestamp > 0)
+        printk(KERN_INFO "[stager][tracker][ %u > %u ] Iface: %d Bytes: %u\n",
                     isrc_port, idst_port,
-                    report_timestamp, report_bytes);
+                    iface,
+                    (report_bytes*1000)/delta_time);
+#endif
 }
 
 
@@ -378,7 +395,7 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
 {
     struct iphdr *_ipheader = ip_hdr(skb);
 
-    printk(KERN_INFO " * add_l4_flow_to_iface\n");
+    // printk(KERN_INFO " * add_l4_flow_to_iface\n");
 
     skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
 
@@ -389,8 +406,8 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
 
         _update_iface_stats(skb, iface);
 
-        printk(KERN_INFO "[add_l4_flow_to_iface] Port src: [%u]; dst: [%u]; seq: [%u]\n",
-            ntohs(tcp_header->source), ntohs(tcp_header->dest), ntohl(tcp_header->seq));
+        // printk(KERN_INFO "[add_l4_flow_to_iface] Port src: [%u]; dst: [%u]; seq: [%u]\n",
+        //     ntohs(tcp_header->source), ntohs(tcp_header->dest), ntohl(tcp_header->seq));
 
         src = ntohs(tcp_header->source);
         dst = ntohs(tcp_header->dest);
@@ -413,14 +430,15 @@ _do_flows_switch(u16 count, u16 from, u16 to)
     u16 still_switching = count;
     struct l4_flow *p;
 
-    printk(KERN_INFO "[stager] About to move %d flows from %d to %d\n",
-        count, from, to);
+    // printk(KERN_INFO "[stager] About to move %d flows from %d to %d\n",
+    //     count, from, to);
 
     rcu_read_lock();
     list_for_each_entry_rcu(p, &flows_head, flows_list)
     {
 
         struct l4_flow *u_flow;
+        struct old_l4_flow *rel_flow;
 
         spin_lock_bh(&lock_update_flow);
         if (p->path_id == from)
@@ -432,10 +450,12 @@ _do_flows_switch(u16 count, u16 from, u16 to)
 
             u_flow->path_id = to;
 
+            rel_flow = kmalloc(sizeof(struct old_l4_flow), GFP_ATOMIC);
+            rel_flow->old_flow = p;
+
             list_replace_rcu(&p->flows_list, &u_flow->flows_list);
             spin_unlock_bh(&lock_update_flow);
-            synchronize_rcu();
-            kfree(p);
+            call_rcu_bh(&rel_flow->rcu, flow_reclaim);
 
             /* Update the counter for flows per path */
             spin_lock_bh(&lock_path_flows_count);
@@ -485,6 +505,8 @@ _do_restage(u16 *ideal_fc)
     // }
 
     // fc_diff = fc_diff / 2;
+
+    /* Static route simulation: comment the following line */
     _do_flows_switch(fc_diff, from_iface, to_iface);
 }
 
@@ -527,11 +549,13 @@ _stage_flows(void)
             // }
             should_restage = 1;
 
-            printk(KERN_INFO "[stager] Restage for iface: %d\n", i);
+            // printk(KERN_INFO "[stager] Restage for iface: %d\n", i);
             last_restage_srtt_val[i] = srtt[i];
             break;
         }
     }
+
+    // printk(KERN_INFO "Restage not needed.");
 
     /* Should perform some route calculation then re-staging here */
     if (should_restage)
@@ -629,11 +653,14 @@ get_iface_for_skb(struct sk_buff *skb)
 
     /* Static route simulation: even-numbered ports routed through iface 1 */
     // if ((dest_port & 0x01) == 0){
-        printk(KERN_INFO
-            "[get_iface_for_skb] Traffic on port even-number [%d] is routed through iface 1.\n",
-                dest_port);
+        // printk(KERN_INFO
+        //     "[get_iface_for_skb] Traffic on port even-number [%d] is routed through iface 1.\n",
+        //         dest_port);
         return 1;
     }
+    // else {
+    //     return 0;
+    // }
 #endif
 
     rcu_read_lock();
@@ -648,8 +675,8 @@ get_iface_for_skb(struct sk_buff *skb)
     rcu_read_unlock();
 
 
-    printk(KERN_INFO "[get_iface_for_skb] flow [%d, %d] uses %d.\n",
-        source_port, dest_port, result);
+    // printk(KERN_INFO "[get_iface_for_skb] flow [%d, %d] uses %d.\n",
+    //     source_port, dest_port, result);
     return result;
 }
 
@@ -693,7 +720,7 @@ static struct rtnl_link_stats64 *ipip_get_stats64(struct net_device *dev,
     int i;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_get_stats64\n");
+    // printk(KERN_INFO "* ipip_get_stats64\n");
 
 
     for_each_possible_cpu(i) {
@@ -752,7 +779,7 @@ static struct ip_tunnel *ipip_tunnel_lookup(struct net *net,
 
     /* stager dev */
     /* override the lookup procedure and return our only tunnel */
-    printk(KERN_INFO "    overriding lookup\n");
+    // printk(KERN_INFO "    overriding lookup\n");
     return rcu_dereference(ipn->tunnels_r_l[h0 ^ h1]);
 
     return NULL;
@@ -767,7 +794,7 @@ static struct ip_tunnel __rcu **__ipip_bucket(struct ipip_net *ipn,
     int prio = 0;
 
     /* stager dev */
-    printk(KERN_INFO "* __ipip_bucket\n");
+    // printk(KERN_INFO "* __ipip_bucket\n");
 
     if (remote) {
         prio |= 2;
@@ -779,8 +806,8 @@ static struct ip_tunnel __rcu **__ipip_bucket(struct ipip_net *ipn,
     }
 
     /* stager dev */
-    printk(KERN_INFO "    remote: [%pI4]; local: [%pI4]; prio: [%d]; hash: [%u]\n",
-        &remote, &local, prio, h);
+    // printk(KERN_INFO "    remote: [%pI4]; local: [%pI4]; prio: [%d]; hash: [%u]\n",
+    //     &remote, &local, prio, h);
 
     return &ipn->tunnels[prio][h];
 }
@@ -983,7 +1010,7 @@ static inline void ipip_ecn_decapsulate(const struct iphdr *outer_iph,
     struct iphdr *inner_iph = ip_hdr(skb);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_ecn_decapsulate\n");
+    // printk(KERN_INFO "* ipip_ecn_decapsulate\n");
 
     if (INET_ECN_is_ce(outer_iph->tos))
         IP_ECN_set_ce(inner_iph);
@@ -1022,8 +1049,8 @@ static int ipip_rcv(struct sk_buff *skb)
         u64_stats_update_end(&tstats->syncp);
 
         /* stager dev */
-        printk(KERN_INFO "[ipip_rcv] outer: [%pI4, %pI4]; inner: [%pI4, %pI4]\n",
-            &iph->saddr, &iph->daddr, &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr);
+        // printk(KERN_INFO "[ipip_rcv] outer: [%pI4, %pI4]; inner: [%pI4, %pI4]\n",
+        //     &iph->saddr, &iph->daddr, &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr);
         if ((in_aton("192.168.0.2") == iph->daddr) ||
             (in_aton("192.168.1.2") == iph->daddr)) {
             add_l4_flow_to_iface(skb, 0);
@@ -1042,7 +1069,7 @@ static int ipip_rcv(struct sk_buff *skb)
     rcu_read_unlock();
 
     /* stager dev */
-    printk(KERN_INFO "    tunnel_lookup returned NULL && packet dropped\n");
+    // printk(KERN_INFO "    tunnel_lookup returned NULL && packet dropped\n");
 
     return -1;
 }
@@ -1072,7 +1099,7 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
     /* stager dev */
     __be32 mangle_dst;
     __be32 mangle_src;
-    printk(KERN_INFO "* ipip_tunnel_xmit\n");
+    // printk(KERN_INFO "* ipip_tunnel_xmit\n");
 
 
     if (skb->protocol != htons(ETH_P_IP))
@@ -1098,7 +1125,7 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
         printk(KERN_INFO "[ipip_tunnel_xmit] Not a TCP flow. Using default iface [0]\n");
         i = 0;
     }
-    printk(KERN_INFO "[ipip_tunnel_xmit] Sending packet on iface: eth%d.\n", i);
+    // printk(KERN_INFO "[ipip_tunnel_xmit] Sending packet on iface: eth%d.\n", i);
 
     /* Need to mangle if 1 */
     if (i == 1){
@@ -1233,7 +1260,7 @@ static void ipip_tunnel_bind_dev(struct net_device *dev)
     const struct iphdr *iph;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_bind_dev\n");
+    // printk(KERN_INFO "* ipip_tunnel_bind_dev\n");
 
     tunnel = netdev_priv(dev);
     iph = &tunnel->parms.iph;
@@ -1275,7 +1302,7 @@ ipip_tunnel_ioctl (struct net_device *dev, struct ifreq *ifr, int cmd)
     struct ipip_net *ipn = net_generic(net, ipip_net_id);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_ioctl\n");
+    // printk(KERN_INFO "* ipip_tunnel_ioctl\n");
 
     switch (cmd) {
     case SIOCGETTUNNEL:
@@ -1387,7 +1414,7 @@ done:
 static int ipip_tunnel_change_mtu(struct net_device *dev, int new_mtu)
 {
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_change_mtu\n");
+    // printk(KERN_INFO "* ipip_tunnel_change_mtu\n");
 
     if (new_mtu < 68 || new_mtu > 0xFFF8 - sizeof(struct iphdr))
         return -EINVAL;
@@ -1406,7 +1433,7 @@ static const struct net_device_ops ipip_netdev_ops = {
 static void ipip_dev_free(struct net_device *dev)
 {
     /* stager dev */
-    printk(KERN_INFO "* ipip_dev_free\n");
+    // printk(KERN_INFO "* ipip_dev_free\n");
 
     free_percpu(dev->tstats);
     free_netdev(dev);
@@ -1415,7 +1442,7 @@ static void ipip_dev_free(struct net_device *dev)
 static void ipip_tunnel_setup(struct net_device *dev)
 {
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_setup: filling the net_device structure\n");
+    // printk(KERN_INFO "* ipip_tunnel_setup: filling the net_device structure\n");
 
     dev->netdev_ops     = &ipip_netdev_ops;
     dev->destructor     = ipip_dev_free;
@@ -1436,9 +1463,9 @@ static int ipip_tunnel_init(struct net_device *dev)
     struct ip_tunnel *tunnel = netdev_priv(dev);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_init\n");
-    printk(KERN_INFO "    saddr: [%pI4]; daddr: [%pI4]\n",
-        &tunnel->parms.iph.saddr, &tunnel->parms.iph.daddr);
+    // printk(KERN_INFO "* ipip_tunnel_init\n");
+    // printk(KERN_INFO "    saddr: [%pI4]; daddr: [%pI4]\n",
+    //     &tunnel->parms.iph.saddr, &tunnel->parms.iph.daddr);
 
     tunnel->dev = dev;
 
@@ -1461,8 +1488,8 @@ static int __net_init ipip_fb_tunnel_init(struct net_device *dev)
     struct ipip_net *ipn = net_generic(dev_net(dev), ipip_net_id);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_fb_tunnel_init\n");
-    printk(KERN_INFO "    dev->name: [%s]\n", dev->name);
+    // printk(KERN_INFO "* ipip_fb_tunnel_init\n");
+    // printk(KERN_INFO "    dev->name: [%s]\n", dev->name);
 
     tunnel->dev = dev;
     strcpy(tunnel->parms.name, dev->name);
@@ -1494,7 +1521,7 @@ static void ipip_destroy_tunnels(struct ipip_net *ipn, struct list_head *head)
     int prio;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_destroy_tunnels\n");
+    // printk(KERN_INFO "* ipip_destroy_tunnels\n");
 
     for (prio = 1; prio < 4; prio++) {
         int h;
@@ -1517,7 +1544,7 @@ static int __net_init ipip_init_net(struct net *net)
     int err;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_init_net\n");
+    // printk(KERN_INFO "* ipip_init_net\n");
 
     ipn->tunnels[0] = ipn->tunnels_wc;
     ipn->tunnels[1] = ipn->tunnels_l;
@@ -1558,8 +1585,8 @@ static void __net_exit ipip_exit_net(struct net *net)
     LIST_HEAD(list);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_exit_net\n");
-    printk(KERN_INFO "    net->proc_net->name: [%s]\n", net->proc_net->name);
+    // printk(KERN_INFO "* ipip_exit_net\n");
+    // printk(KERN_INFO "    net->proc_net->name: [%s]\n", net->proc_net->name);
 
     rtnl_lock();
     ipip_destroy_tunnels(ipn, &list);
@@ -1580,7 +1607,7 @@ static int __init ipip_init(void)
     int err;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_init\n");
+    // printk(KERN_INFO "* ipip_init\n");
 
     printk(banner);
 
