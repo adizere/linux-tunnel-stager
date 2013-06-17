@@ -44,13 +44,13 @@ init_shaper;
 
 
 while true ; do
-    modify_bandwidth 'eth3' 3000Kbit 120ms
     modify_bandwidth 'eth1' 2000Kbit 160ms
+    modify_bandwidth 'eth3' 3000Kbit 120ms
     echo "---";
     sleep 40;
 
-    modify_bandwidth 'eth3' 2000Kbit 160ms
     modify_bandwidth 'eth1' 3000Kbit 120ms
+    modify_bandwidth 'eth3' 2000Kbit 160ms
     echo "---";
 
     sleep 40;
