@@ -140,17 +140,22 @@
     * concurrency control on all global variables with RCU and locks
 */
 #define PATHS_COUNT 2
-#define TRACKER_INTERVAL 1950
+#define TRACKER_INTERVAL 950
+#define RESTAGE_TIMEOUT 2000
+#define FLOW_SWITCH_TIMEOUT 10000
+
 
 static DEFINE_SPINLOCK(lock_path_flows_count);
 static DEFINE_SPINLOCK(lock_update_flow);
 static DEFINE_SPINLOCK(lock_add_flow);
+static DEFINE_SPINLOCK(lock_restage);
 
 
 struct l4_flow {
     __u16 src_port;
     __u16 dst_port;
-    __u32 last_jiffies;
+    __u32 bytes_tracker_ts;
+    __u32 switch_tracker_ts;
     __be32 bytes;
     u8 path_id;
     struct list_head flows_list;
@@ -196,7 +201,8 @@ static u16 last_restage_srtt_val[PATHS_COUNT] = {USHRT_MAX, USHRT_MAX};
 /* congestion factor */
 static u16 cf[PATHS_COUNT] = {0, 0};
 
-
+/* Last restaging timestamp */
+static u32 last_restage_ts = 0;
 
 /*
     Should update the RTT average value per iface
@@ -244,7 +250,7 @@ _update_iface_stats(struct sk_buff *skb, int iface)
         *this_srtt = rtt_instant;
     } else {
         /* Compute the average RTT */
-        temp_srtt = 975*(*this_srtt)*1000 + 975*(*this_srtt_rest) + 25*rtt_instant*1000;
+        temp_srtt = 980*(*this_srtt)*1000 + 980*(*this_srtt_rest) + 20*rtt_instant*1000;
         temp_srtt = temp_srtt / 1000;
         *this_srtt = temp_srtt / 1000;
         *this_srtt_rest = temp_srtt % 1000;
@@ -305,10 +311,15 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
         spin_lock_bh(&lock_update_flow);
         if ((p->src_port == isrc_port) && (p->dst_port == idst_port))
         {
-            delta_time =
-                jiffies_to_msecs(tcp_time_stamp - p->last_jiffies);
-
+#ifdef STAGER_SITE_A
             found = 1;
+            spin_unlock_bh(&lock_update_flow);
+            break;
+#else
+            found = 1;
+
+            delta_time =
+                jiffies_to_msecs(tcp_time_stamp - p->bytes_tracker_ts);
 
             u_flow = kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
             *u_flow = *p;
@@ -318,10 +329,10 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
 
             if (delta_time > TRACKER_INTERVAL)
             {
-                report_timestamp = p->last_jiffies;
+                report_timestamp = p->bytes_tracker_ts;
                 report_bytes = p->bytes + ibytes;
 
-                u_flow->last_jiffies = tcp_time_stamp;
+                u_flow->bytes_tracker_ts = tcp_time_stamp;
                 u_flow->bytes = 0;
             } else {
                 u_flow->bytes += ibytes;
@@ -346,6 +357,7 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
             }
 
             break;
+#endif
         } else {
             spin_unlock_bh(&lock_update_flow);
         }
@@ -364,7 +376,8 @@ _do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
         flow_id->dst_port = idst_port;
         flow_id->bytes = ibytes;
         flow_id->path_id = iface;
-        flow_id->last_jiffies = tcp_time_stamp;
+        flow_id->bytes_tracker_ts = tcp_time_stamp;
+        flow_id->switch_tracker_ts = 0;
 
         list_add_rcu(&flow_id->flows_list, &flows_head);
         spin_unlock_bh(&lock_add_flow);
@@ -411,14 +424,14 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
 
         src = ntohs(tcp_header->source);
         dst = ntohs(tcp_header->dest);
-        bytes = _ipheader->tot_len;
+        bytes = ntohs(_ipheader->tot_len);
 
         _do_flow_add(src, dst, bytes, iface);
 
     } else {
-        printk(KERN_INFO "[ipip_rcv] Protocol is not TCP\n");
+        printk(KERN_INFO "[add_l4_flow_to_iface] Protocol is not TCP\n");
         if (_ipheader->protocol == IPPROTO_ICMP){
-            printk(KERN_INFO "[ipip_rcv] Protocol is ICMP\n");
+            printk(KERN_INFO "[add_l4_flow_to_iface] Protocol is ICMP\n");
         }
     }
 }
@@ -430,18 +443,27 @@ _do_flows_switch(u16 count, u16 from, u16 to)
     u16 still_switching = count;
     struct l4_flow *p;
 
-    // printk(KERN_INFO "[stager] About to move %d flows from %d to %d\n",
-    //     count, from, to);
+    printk(KERN_INFO "[staging counter %u %u ] --- %d flows from %d to %d\n",
+        path_flows_count[0], path_flows_count[1],
+        count, from, to);
 
     rcu_read_lock();
     list_for_each_entry_rcu(p, &flows_head, flows_list)
     {
-
         struct l4_flow *u_flow;
         struct old_l4_flow *rel_flow;
+        u32 delta_switch;
+        if (p->switch_tracker_ts == 0)
+        {
+            delta_switch = FLOW_SWITCH_TIMEOUT + 1;
+        }
+        else {
+            delta_switch =
+                jiffies_to_msecs(tcp_time_stamp - p->switch_tracker_ts);
+        }
 
         spin_lock_bh(&lock_update_flow);
-        if (p->path_id == from)
+        if ((p->path_id == from) && (delta_switch > FLOW_SWITCH_TIMEOUT))
         {
             still_switching--;
 
@@ -449,6 +471,7 @@ _do_flows_switch(u16 count, u16 from, u16 to)
             *u_flow = *p;
 
             u_flow->path_id = to;
+            u_flow->switch_tracker_ts = tcp_time_stamp;
 
             rel_flow = kmalloc(sizeof(struct old_l4_flow), GFP_ATOMIC);
             rel_flow->old_flow = p;
@@ -462,6 +485,9 @@ _do_flows_switch(u16 count, u16 from, u16 to)
             path_flows_count[from]--;
             path_flows_count[to]++;
             spin_unlock_bh(&lock_path_flows_count);
+
+            printk(KERN_INFO "[staging] %u %d -> %d\n",
+                u_flow->src_port, from, to);
 
             if (still_switching == 0)
                 break;
@@ -500,11 +526,10 @@ _do_restage(u16 *ideal_fc)
         to_iface = 1;
     }
 
-    // if (fc_diff <= 2){
-    //     return;
-    // }
-
-    // fc_diff = fc_diff / 2;
+    if (fc_diff > 4)
+    {
+        fc_diff = 4;
+    }
 
     /* Static route simulation: comment the following line */
     _do_flows_switch(fc_diff, from_iface, to_iface);
@@ -538,18 +563,18 @@ _stage_flows(void)
         if ((10*(srtt[i] - (srtt_min[i])) > 5*srtt_min[i]) &&
             (10*abs(last_restage_srtt_val[i] - srtt[i]) > 5*srtt_min[i]))
         {
-            // if (last_ts_switch == 0){
-            //     last_ts_switch = tcp_time_stamp;
-            //     should_restage = 1;
-            // } else {
-            //     if (tcp_time_stamp - last_ts_switch > 1000) {
-            //         last_ts_switch = tcp_time_stamp;
-            //         should_restage = 1;
-            //     }
-            // }
-            should_restage = 1;
+            spin_lock_bh(&lock_restage);
 
-            // printk(KERN_INFO "[stager] Restage for iface: %d\n", i);
+            if ((last_restage_ts == 0) ||
+                 (jiffies_to_msecs(tcp_time_stamp - last_restage_ts)
+                    > RESTAGE_TIMEOUT))
+            {
+                last_restage_ts = tcp_time_stamp;
+                should_restage = 1;
+            }
+
+            spin_unlock_bh(&lock_restage);
+
             last_restage_srtt_val[i] = srtt[i];
             break;
         }
@@ -653,9 +678,9 @@ get_iface_for_skb(struct sk_buff *skb)
 
     /* Static route simulation: even-numbered ports routed through iface 1 */
     // if ((dest_port & 0x01) == 0){
-        // printk(KERN_INFO
-        //     "[get_iface_for_skb] Traffic on port even-number [%d] is routed through iface 1.\n",
-        //         dest_port);
+    //     printk(KERN_INFO
+    //         "[get_iface_for_skb] Traffic on port even-number [%d] is routed through iface 1.\n",
+    //             dest_port);
         return 1;
     }
     // else {
@@ -674,13 +699,10 @@ get_iface_for_skb(struct sk_buff *skb)
     }
     rcu_read_unlock();
 
-
-    // printk(KERN_INFO "[get_iface_for_skb] flow [%d, %d] uses %d.\n",
-    //     source_port, dest_port, result);
     return result;
 }
 
-/* Stager Dev */
+/* Stager Dev END */
 
 
 static int ipip_net_id __read_mostly;
