@@ -28,7 +28,7 @@
 #include <unistd.h>
 
 #define SIZE_OF_CHUNK 1024
-#define MIN_SLEEP_TIME 0.001		// in s.
+#define MIN_SLEEP_TIME 0.0001		// in s.
 
 main(int argc, char **argv) {
    int sock, bandwidth, len_addr, i, j, k, data, packet_size;
@@ -54,7 +54,7 @@ main(int argc, char **argv) {
     }
     printf("everything is ok so far..\n");
     printf("%d\n", argc);
-    bandwidth = 1000;
+    bandwidth = 1000000;
     i = send(sock, &bandwidth, sizeof(int), 0);
     printf("am trimis la server %d bytes.\n",i);
 
@@ -88,7 +88,7 @@ main(int argc, char **argv) {
 	}
 
 	/* Don't rush it */
-	usleep(1000); 
+	usleep(100); 
 
 	j += ((k=send(sock, chunk, bandwidth%packet_size, 0))>0? k: 0);
 	if (k==-1) perror("error at send: ");

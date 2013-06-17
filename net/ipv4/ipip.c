@@ -113,6 +113,10 @@
 #include <net/tcp.h> /* for tcp_parse_options() */
 /* FIXME: move all stager-related code to a separate source */
 // #include "ipip_stager.h"
+#include <linux/spinlock.h>
+#include <linux/jiffies.h>
+#include <linux/list.h>
+
 
 
 #include <net/sock.h>
@@ -136,10 +140,30 @@
     * concurrency control on all global variables with RCU and locks
 */
 #define PATHS_COUNT 2
+#define TRACKER_INTERVAL 950
+#define RESTAGE_TIMEOUT 2000
+#define FLOW_SWITCH_TIMEOUT 10000
+
+
+static DEFINE_SPINLOCK(lock_path_flows_count);
+static DEFINE_SPINLOCK(lock_update_flow);
+static DEFINE_SPINLOCK(lock_add_flow);
+static DEFINE_SPINLOCK(lock_restage);
+
 
 struct l4_flow {
     __u16 src_port;
     __u16 dst_port;
+    __u32 bytes_tracker_ts;
+    __u32 switch_tracker_ts;
+    __be32 bytes;
+    u8 path_id;
+    struct list_head flows_list;
+};
+
+struct old_l4_flow {
+    struct l4_flow *old_flow;
+    struct rcu_head rcu;
 };
 
 /* Packet descriptor: FIXME not used yet */
@@ -157,13 +181,16 @@ struct packet_descriptor {
     ***/
 
 /* Which are the flows served on each path */
-static struct l4_flow *path_flows[PATHS_COUNT][50];
+static LIST_HEAD(flows_head);
 
 /* How many flows each path is serving */
 static u16 path_flows_count[PATHS_COUNT] = {0, 0};
 
 /* smoothed rtt (SRTT) */
 static u16 srtt[PATHS_COUNT] = {0, 0};
+
+/* SRTT remainder */
+static u16 srtt_rest[PATHS_COUNT] = {0, 0};
 
 /* minimum srtt */
 static u16 srtt_min[PATHS_COUNT] = {USHRT_MAX, USHRT_MAX};
@@ -174,6 +201,8 @@ static u16 last_restage_srtt_val[PATHS_COUNT] = {USHRT_MAX, USHRT_MAX};
 /* congestion factor */
 static u16 cf[PATHS_COUNT] = {0, 0};
 
+/* Last restaging timestamp */
+static u32 last_restage_ts = 0;
 
 /*
     Should update the RTT average value per iface
@@ -185,7 +214,8 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 {
     const u8 *hash_location; /* we'll ignore this anyway */
     struct tcp_options_received *rx_opt; /* defined in linux/tcp.h */
-    u16 *this_srtt, *this_cf;
+    u16 *this_srtt, *this_srtt_min, *this_cf, *this_srtt_rest;
+    u64 temp_srtt;
     u32 rtt_instant;
     s32 rtt_diff;
     struct tcphdr *tcp_header = tcp_hdr(skb);
@@ -193,8 +223,6 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     /* RST packets should not carry timestamps (rfc1323) */
     if (tcp_header->rst)
         return;
-
-    printk(KERN_INFO " * _update_iface_stats\n");
 
     /* Structure in whil we'll keep the TCP Header Options */
     rx_opt = (struct tcp_options_received*)
@@ -209,100 +237,161 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     /* Get the last RTT */
     rtt_instant = tcp_time_stamp - rx_opt->rcv_tsecr;
 
+    if (rtt_instant > 250)
+        return;
+
     rcu_assign_pointer(this_srtt, &srtt[iface]);
     rcu_assign_pointer(this_cf, &cf[iface]);
+    rcu_assign_pointer(this_srtt_rest, &srtt_rest[iface]);
 
-    /* Compute the average RTT */
-    *this_srtt = 9*(*this_srtt) + 1*rtt_instant;
-    *this_srtt = *this_srtt/10;
+    if (*this_srtt == 0){
+        *this_srtt = rtt_instant;
+    } else {
+        /* Compute the average RTT */
+        temp_srtt = 980*(*this_srtt)*1000 + 980*(*this_srtt_rest) + 20*rtt_instant*1000;
+        temp_srtt = temp_srtt / 1000;
+        *this_srtt = temp_srtt / 1000;
+        *this_srtt_rest = temp_srtt % 1000;
+    }
+
+    /* FIXME: we should not depend on this hardcoded value */
+    if (*this_srtt < *this_srtt_min && *this_srtt > 40)
+        *this_srtt_min = *this_srtt;
 
     /* difference between the instant RTT and the smoothed RTT */
-    rtt_diff = (rtt_instant > *this_srtt)? rtt_instant > *this_srtt : 0;
+    // rtt_diff = rtt_instant - *this_srtt;
+    // if (rtt_diff < 0) rtt_diff = 0;
+
+    rtt_diff = *this_srtt - *this_srtt_min;
+    if (rtt_diff < 0) rtt_diff = 0;
 
     /* Adjust the congestion factor; smooth variation */
     *this_cf = 9*(*this_cf) + 1*rtt_diff;
-    *this_cf = *this_cf/10;
-
+    *this_cf = *this_srtt / 10;
 
 
     printk(KERN_INFO "[stager][_update_iface_stats] Final stats for iface %d "
-        "[rtt] %d [srtt] %d %d [srtt_min] %d %d [rttd] %d [cf] %d %d\n",
+        "[rtt] %d [srtt] %d %d [srtt_min] %d %d [rttd] %d [rest] %d %d\n",
         iface, rtt_instant, srtt[0], srtt[1], srtt_min[0], srtt_min[1],
-        rtt_diff, cf[0], cf[1]);
-}
-
-
-static struct l4_flow*
-_get_packet_descriptor(struct sk_buff *skb)
-{
-
-    return NULL;
+        rtt_diff, srtt_rest[0], srtt_rest[1]);
 }
 
 
 static void
-_do_flow_add(struct l4_flow *flow_id, int iface)
+flow_reclaim(struct rcu_head *rp)
 {
-    u16 i, *marked_iface_count, *unmarked_iface_count;
-    struct l4_flow **marked_iface, **unmarked_iface;
+    struct old_l4_flow *fp = container_of(rp, struct old_l4_flow, rcu);
+
+    kfree(fp->old_flow);
+    kfree(fp);
+}
+
+static void
+_do_flow_add(__u16 isrc_port, __u16 idst_port, __be16 ibytes, int iface)
+{
+    u8 found = 0;
+    struct l4_flow *p;
+    __u32 report_timestamp = 0, delta_time = 0;
+    __be32 report_bytes = 0;
 
 
-    /* FIXME: should not assume there are only 2 paths */
-    if (iface == 0){
-        rcu_assign_pointer(marked_iface, path_flows[0]);
-        rcu_assign_pointer(marked_iface_count, &path_flows_count[0]);
+    if (iface >= 2) return;
 
-        rcu_assign_pointer(unmarked_iface, path_flows[1]);
-        rcu_assign_pointer(unmarked_iface_count, &path_flows_count[1]);
-    } else {
-        rcu_assign_pointer(marked_iface, path_flows[1]);
-        rcu_assign_pointer(marked_iface_count, &path_flows_count[1]);
-
-        rcu_assign_pointer(unmarked_iface, path_flows[0]);
-        rcu_assign_pointer(unmarked_iface_count, &path_flows_count[0]);
-    }
-
-    /* Scoatem flow_id din vectorul cu flowurile corespondente interfetei
-        unmarked.
-    */
-    for (i = 0; i < *unmarked_iface_count-1; ++i)
+    /* Sequential search; check if we've already seen this flow */
+    rcu_read_lock_bh();
+    list_for_each_entry_rcu(p, &flows_head, flows_list)
     {
-        if ((unmarked_iface[i]->src_port == flow_id->src_port) &&
-            (unmarked_iface[i]->dst_port == flow_id->dst_port)){
-#ifndef STAGER_SITE_A
-            kfree(unmarked_iface[i]);
+
+        u8 switched = 0;
+        struct l4_flow *u_flow;
+        struct old_l4_flow *rel_flow;
+
+        spin_lock_bh(&lock_update_flow);
+        if ((p->src_port == isrc_port) && (p->dst_port == idst_port))
+        {
+#ifdef STAGER_SITE_A
+            found = 1;
+            spin_unlock_bh(&lock_update_flow);
+            break;
+#else
+            found = 1;
+
+            delta_time =
+                jiffies_to_msecs(tcp_time_stamp - p->bytes_tracker_ts);
+
+            u_flow = kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
+            *u_flow = *p;
+
+            rel_flow = kmalloc(sizeof(struct old_l4_flow), GFP_ATOMIC);
+            rel_flow->old_flow = p;
+
+            if (delta_time > TRACKER_INTERVAL)
+            {
+                report_timestamp = p->bytes_tracker_ts;
+                report_bytes = p->bytes + ibytes;
+
+                u_flow->bytes_tracker_ts = tcp_time_stamp;
+                u_flow->bytes = 0;
+            } else {
+                u_flow->bytes += ibytes;
+            }
+
+            if (u_flow->path_id != iface)
+            {
+                u_flow->path_id = iface;
+                switched = 1;
+            }
+            list_replace_rcu(&p->flows_list, &u_flow->flows_list);
+            spin_unlock_bh(&lock_update_flow);
+            call_rcu_bh(&rel_flow->rcu, flow_reclaim);
+
+            /* Update the counter for flows per path */
+            if (switched)
+            {
+                spin_lock_bh(&lock_path_flows_count);
+                path_flows_count[1-iface]--;
+                path_flows_count[iface]++;
+                spin_unlock_bh(&lock_path_flows_count);
+            }
+
+            break;
 #endif
-
-            unmarked_iface[i] = unmarked_iface[*unmarked_iface_count-1];
-            (*unmarked_iface_count)--;
-            printk(KERN_INFO "[add_l4_flow_to_iface] Removed flow id [%d, %d]"
-                "from interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
-                (iface+1)%2, *unmarked_iface_count);
-            break;
+        } else {
+            spin_unlock_bh(&lock_update_flow);
         }
     }
+    rcu_read_unlock_bh();
 
-    /*
-        Daca flow_id nu e in lista de flowuri din interfata marked atunci
-        il adaugam.
-    */
-    for (i = 0; i < *marked_iface_count; ++i)
+    /* Fresh new flow, allocate and add it to our list */
+    if (found == 0)
     {
-        if ((marked_iface[i]->src_port == flow_id->src_port) &&
-            (marked_iface[i]->dst_port == flow_id->dst_port)){
-            printk(KERN_INFO "[stager] Found flow id [%d, %d] "
-                "in interface [%d]\n", flow_id->src_port, flow_id->dst_port, iface);
-            break;
-        }
-    }
-    if (i == *marked_iface_count) {
-        marked_iface[i] = flow_id;
-        (*marked_iface_count)++;
+        struct l4_flow *flow_id;
 
-        printk(KERN_INFO "[stager] Added flow id [%d, %d] "
-            "to interface [%d]; iface count: [%d]\n", flow_id->src_port, flow_id->dst_port,
-            iface, *marked_iface_count);
+        spin_lock_bh(&lock_add_flow);
+        flow_id = kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
+
+        flow_id->src_port = isrc_port;
+        flow_id->dst_port = idst_port;
+        flow_id->bytes = ibytes;
+        flow_id->path_id = iface;
+        flow_id->bytes_tracker_ts = tcp_time_stamp;
+        flow_id->switch_tracker_ts = 0;
+
+        list_add_rcu(&flow_id->flows_list, &flows_head);
+        spin_unlock_bh(&lock_add_flow);
+
+        spin_lock_bh(&lock_path_flows_count);
+        path_flows_count[iface]++;
+        spin_unlock_bh(&lock_path_flows_count);
     }
+
+#ifndef STAGER_SITE_A
+    if (report_timestamp > 0)
+        printk(KERN_INFO "[stager][tracker][ %u > %u ] Iface: %d Bytes: %u\n",
+                    isrc_port, idst_port,
+                    iface,
+                    (report_bytes*1000)/delta_time);
+#endif
 }
 
 
@@ -317,32 +406,30 @@ add_l4_flow_to_iface(struct sk_buff *skb, int iface)
 {
     struct iphdr *_ipheader = ip_hdr(skb);
 
-    printk(KERN_INFO " * add_l4_flow_to_iface\n");
+    // printk(KERN_INFO " * add_l4_flow_to_iface\n");
 
     skb->transport_header = skb->network_header + ((ip_hdr(skb)->ihl)<<2);
 
     if (_ipheader->protocol == IPPROTO_TCP){
         struct tcphdr *tcp_header = tcp_hdr(skb);
-        struct l4_flow *flow_id = NULL;
-
-        flow_id = (struct l4_flow*) kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
-        if (flow_id == NULL)
-            return;
+        __u16 src, dst;
+        __be16 bytes;
 
         _update_iface_stats(skb, iface);
 
-        printk(KERN_INFO "[add_l4_flow_to_iface] Port src: [%u]; dst: [%u]; seq: [%u]\n",
-            ntohs(tcp_header->source), ntohs(tcp_header->dest), ntohl(tcp_header->seq));
+        // printk(KERN_INFO "[add_l4_flow_to_iface] Port src: [%u]; dst: [%u]; seq: [%u]\n",
+        //     ntohs(tcp_header->source), ntohs(tcp_header->dest), ntohl(tcp_header->seq));
 
-        flow_id->src_port = ntohs(tcp_header->source);
-        flow_id->dst_port = ntohs(tcp_header->dest);
+        src = ntohs(tcp_header->source);
+        dst = ntohs(tcp_header->dest);
+        bytes = ntohs(_ipheader->tot_len);
 
-        _do_flow_add(flow_id, iface);
+        _do_flow_add(src, dst, bytes, iface);
 
     } else {
-        printk(KERN_INFO "[ipip_rcv] Protocol is not TCP\n");
+        printk(KERN_INFO "[add_l4_flow_to_iface] Protocol is not TCP\n");
         if (_ipheader->protocol == IPPROTO_ICMP){
-            printk(KERN_INFO "[ipip_rcv] Protocol is ICMP\n");
+            printk(KERN_INFO "[add_l4_flow_to_iface] Protocol is ICMP\n");
         }
     }
 }
@@ -352,22 +439,62 @@ static void
 _do_flows_switch(u16 count, u16 from, u16 to)
 {
     u16 still_switching = count;
-    printk(KERN_INFO "[stager] About to move %d flows from %d to %d\n",
-    count, from, to);
+    struct l4_flow *p;
 
-    while(still_switching)
+    printk(KERN_INFO "[staging counter %u %u ] --- %d flows from %d to %d\n",
+        path_flows_count[0], path_flows_count[1],
+        count, from, to);
+
+    rcu_read_lock();
+    list_for_each_entry_rcu(p, &flows_head, flows_list)
     {
-        /* We'll identify the flows in the 'from' path and add them to
-            the 'to' path
-        */
-        if (path_flows_count[from] > 1){
-            /* Static route simulation: just put a '2' instead of 'to' */
-            _do_flow_add(path_flows[from][0], to);
-        } else {
-            still_switching = 0;
+        struct l4_flow *u_flow;
+        struct old_l4_flow *rel_flow;
+        u32 delta_switch;
+        if (p->switch_tracker_ts == 0)
+        {
+            delta_switch = FLOW_SWITCH_TIMEOUT + 1;
         }
-        still_switching--;
+        else {
+            delta_switch =
+                jiffies_to_msecs(tcp_time_stamp - p->switch_tracker_ts);
+        }
+
+        spin_lock_bh(&lock_update_flow);
+        if ((p->path_id == from) && (delta_switch > FLOW_SWITCH_TIMEOUT))
+        {
+            still_switching--;
+
+            u_flow = kmalloc(sizeof(struct l4_flow), GFP_ATOMIC);
+            *u_flow = *p;
+
+            u_flow->path_id = to;
+            u_flow->switch_tracker_ts = tcp_time_stamp;
+
+            rel_flow = kmalloc(sizeof(struct old_l4_flow), GFP_ATOMIC);
+            rel_flow->old_flow = p;
+
+            list_replace_rcu(&p->flows_list, &u_flow->flows_list);
+            spin_unlock_bh(&lock_update_flow);
+            call_rcu_bh(&rel_flow->rcu, flow_reclaim);
+
+            /* Update the counter for flows per path */
+            spin_lock_bh(&lock_path_flows_count);
+            path_flows_count[from]--;
+            path_flows_count[to]++;
+            spin_unlock_bh(&lock_path_flows_count);
+
+            printk(KERN_INFO "[staging] %u %d -> %d\n",
+                u_flow->src_port, from, to);
+
+            if (still_switching == 0)
+                break;
+
+        } else {
+            spin_unlock_bh(&lock_update_flow);
+        }
     }
+    rcu_read_unlock();
 }
 
 
@@ -382,23 +509,27 @@ _do_restage(u16 *ideal_fc)
     u16 fc_diff, from_iface, to_iface;
 
     /* iface 0 should ideally have more connections on it */
+    spin_lock_bh(&lock_path_flows_count);
     if (ideal_fc[0] > path_flows_count[0]){
         fc_diff = ideal_fc[0] - path_flows_count[0];
+        spin_unlock_bh(&lock_path_flows_count);
         printk(KERN_INFO "[stager] Need to move %d flows from eth1 to eth0\n", fc_diff);
         from_iface = 1;
         to_iface = 0;
     } else {
         fc_diff = ideal_fc[1] - path_flows_count[1];
+        spin_unlock_bh(&lock_path_flows_count);
         printk(KERN_INFO "[stager] Need to move %d flows from eth0 to eth1\n", fc_diff);
         from_iface = 0;
         to_iface = 1;
     }
 
-    // if (fc_diff <= 2){
-    //     return;
-    // }
+    if (fc_diff > 4)
+    {
+        fc_diff = 4;
+    }
 
-    // fc_diff = fc_diff / 2;
+    /* Static route simulation: comment the following line */
     _do_flows_switch(fc_diff, from_iface, to_iface);
 }
 
@@ -427,20 +558,33 @@ _stage_flows(void)
     /* Establish if we'll need to restage */
     for (i = 0; i < PATHS_COUNT; ++i)
     {
-        if ((10*(srtt[i] - (srtt_min[i])) > 3 * srtt_min[i]) &&
+        if ((10*(srtt[i] - (srtt_min[i])) > 5*srtt_min[i]) &&
             (10*abs(last_restage_srtt_val[i] - srtt[i]) > 5*srtt_min[i]))
         {
-            should_restage = 1;
-            printk(KERN_INFO "[stager] Restage for iface: %d\n", i);
+            spin_lock_bh(&lock_restage);
+
+            if ((last_restage_ts == 0) ||
+                 (jiffies_to_msecs(tcp_time_stamp - last_restage_ts)
+                    > RESTAGE_TIMEOUT))
+            {
+                last_restage_ts = tcp_time_stamp;
+                should_restage = 1;
+            }
+
+            spin_unlock_bh(&lock_restage);
+
             last_restage_srtt_val[i] = srtt[i];
             break;
         }
     }
 
+    // printk(KERN_INFO "Restage not needed.");
+
     /* Should perform some route calculation then re-staging here */
     if (should_restage)
     {
         int j = 0;
+        int rest = 0;
 
         /* Congestion factor total: sum of cf from all paths */
         u16 cf_total = 0;
@@ -472,10 +616,16 @@ _stage_flows(void)
         }
 
         /* FIXME: how to distribute the flows ? */
+        spin_lock_bh(&lock_path_flows_count);
         tc_total = path_flows_count[0] + path_flows_count[1];
+        spin_unlock_bh(&lock_path_flows_count);
 
         ideal_fc[0] = (tc_total * tw[0] )/100;
         ideal_fc[0] = (ideal_fc[0] > 0) ? ideal_fc[0] : 1;
+
+        rest = (tc_total*tw[0]) % 100;
+        if (rest >= 50)
+            ideal_fc[0]++;
 
         ideal_fc[1] = tc_total - ideal_fc[0];
         if ((tc_total > 1) && (ideal_fc[1] == 0)){
@@ -494,17 +644,6 @@ _stage_flows(void)
             ideal_fc[0], ideal_fc[1],
             tw[0], tw[1],
             last_restage_srtt_val[0], last_restage_srtt_val[1]);
-
-        for (j = 0; j < PATHS_COUNT; ++j)
-        {
-            int i;
-            for (i = 0; i < path_flows_count[j]; ++i)
-            {
-                printk(KERN_INFO "[%d, %d]",
-                    path_flows[j][i]->src_port, path_flows[j][i]->dst_port);
-            }
-            printk(KERN_INFO "\n---\n");
-        }
     }
 }
 
@@ -518,7 +657,8 @@ get_iface_for_skb(struct sk_buff *skb)
     struct tcphdr *tcp_header;
     __be16 source_port;
     __be16 dest_port;
-    int i;
+    int result = 0;
+    struct l4_flow *p;
 
 #ifdef STAGER_SITE_A
     _stage_flows();
@@ -536,28 +676,31 @@ get_iface_for_skb(struct sk_buff *skb)
 
     /* Static route simulation: even-numbered ports routed through iface 1 */
     // if ((dest_port & 0x01) == 0){
-        printk(KERN_INFO
-            "[get_iface_for_skb] Traffic on port even-number is routed through iface 1\n");
+    //     printk(KERN_INFO
+    //         "[get_iface_for_skb] Traffic on port even-number [%d] is routed through iface 1.\n",
+    //             dest_port);
         return 1;
     }
+    // else {
+    //     return 0;
+    // }
 #endif
 
-    for (i = 0; i < path_flows_count[1]; ++i)
+    rcu_read_lock();
+    list_for_each_entry_rcu(p, &flows_head, flows_list)
     {
-        if ((path_flows[1][i]->src_port == dest_port) &&
-            (path_flows[1][i]->dst_port == source_port)){
-            printk(KERN_INFO "[get_iface_for_skb] found flow [%d, %d] for [1]\n",
-                source_port, dest_port);
-            return 1;
+        if ((p->src_port == dest_port) && (p->dst_port == source_port))
+        {
+            result = p->path_id;
+            break;
         }
     }
+    rcu_read_unlock();
 
-    printk(KERN_INFO "[get_iface_for_skb] flow [%d, %d] not found in [1], using [0]\n",
-        source_port, dest_port);
-    return 0;
+    return result;
 }
 
-/* Stager Dev */
+/* Stager Dev END */
 
 
 static int ipip_net_id __read_mostly;
@@ -597,7 +740,7 @@ static struct rtnl_link_stats64 *ipip_get_stats64(struct net_device *dev,
     int i;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_get_stats64\n");
+    // printk(KERN_INFO "* ipip_get_stats64\n");
 
 
     for_each_possible_cpu(i) {
@@ -656,7 +799,7 @@ static struct ip_tunnel *ipip_tunnel_lookup(struct net *net,
 
     /* stager dev */
     /* override the lookup procedure and return our only tunnel */
-    printk(KERN_INFO "    overriding lookup\n");
+    // printk(KERN_INFO "    overriding lookup\n");
     return rcu_dereference(ipn->tunnels_r_l[h0 ^ h1]);
 
     return NULL;
@@ -671,7 +814,7 @@ static struct ip_tunnel __rcu **__ipip_bucket(struct ipip_net *ipn,
     int prio = 0;
 
     /* stager dev */
-    printk(KERN_INFO "* __ipip_bucket\n");
+    // printk(KERN_INFO "* __ipip_bucket\n");
 
     if (remote) {
         prio |= 2;
@@ -683,8 +826,8 @@ static struct ip_tunnel __rcu **__ipip_bucket(struct ipip_net *ipn,
     }
 
     /* stager dev */
-    printk(KERN_INFO "    remote: [%pI4]; local: [%pI4]; prio: [%d]; hash: [%u]\n",
-        &remote, &local, prio, h);
+    // printk(KERN_INFO "    remote: [%pI4]; local: [%pI4]; prio: [%d]; hash: [%u]\n",
+    //     &remote, &local, prio, h);
 
     return &ipn->tunnels[prio][h];
 }
@@ -701,7 +844,7 @@ static void ipip_tunnel_unlink(struct ipip_net *ipn, struct ip_tunnel *t)
     struct ip_tunnel *iter;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_unlink\n");
+    // printk(KERN_INFO "* ipip_tunnel_unlink\n");
 
     for (tp = ipip_bucket(ipn, t);
          (iter = rtnl_dereference(*tp)) != NULL;
@@ -719,7 +862,7 @@ static void ipip_tunnel_link(struct ipip_net *ipn, struct ip_tunnel *t)
     struct ip_tunnel __rcu **tp = ipip_bucket(ipn, t);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_link\n");
+    // printk(KERN_INFO "* ipip_tunnel_link\n");
 
 
     rcu_assign_pointer(t->next, rtnl_dereference(*tp));
@@ -738,9 +881,9 @@ static struct ip_tunnel *ipip_tunnel_locate(struct net *net,
     struct ipip_net *ipn = net_generic(net, ipip_net_id);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_locate\n");
-    printk(KERN_INFO "    create: [%d]; name: [%s]; remote: [%pI4]; local: [%pI4]\n",
-        create, parms->name, &remote, &local);
+    // printk(KERN_INFO "* ipip_tunnel_locate\n");
+    // printk(KERN_INFO "    create: [%d]; name: [%s]; remote: [%pI4]; local: [%pI4]\n",
+    //     create, parms->name, &remote, &local);
 
     for (tp = __ipip_bucket(ipn, parms);
          (t = rtnl_dereference(*tp)) != NULL;
@@ -807,7 +950,7 @@ static void ipip_tunnel_uninit(struct net_device *dev)
     struct ipip_net *ipn = net_generic(net, ipip_net_id);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_uninit\n");
+    // printk(KERN_INFO "* ipip_tunnel_uninit\n");
 
     if (dev == ipn->fb_tunnel_dev)
         RCU_INIT_POINTER(ipn->tunnels_wc[0], NULL);
@@ -830,7 +973,7 @@ static int ipip_err(struct sk_buff *skb, u32 info)
     int err;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_err\n");
+    // printk(KERN_INFO "* ipip_err\n");
 
     switch (type) {
     default:
@@ -887,7 +1030,7 @@ static inline void ipip_ecn_decapsulate(const struct iphdr *outer_iph,
     struct iphdr *inner_iph = ip_hdr(skb);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_ecn_decapsulate\n");
+    // printk(KERN_INFO "* ipip_ecn_decapsulate\n");
 
     if (INET_ECN_is_ce(outer_iph->tos))
         IP_ECN_set_ce(inner_iph);
@@ -899,7 +1042,7 @@ static int ipip_rcv(struct sk_buff *skb)
     const struct iphdr *iph = ip_hdr(skb);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_rcv\n");
+    // printk(KERN_INFO "* ipip_rcv\n");
 
     rcu_read_lock();
     tunnel = ipip_tunnel_lookup(dev_net(skb->dev), iph->saddr, iph->daddr);
@@ -926,8 +1069,8 @@ static int ipip_rcv(struct sk_buff *skb)
         u64_stats_update_end(&tstats->syncp);
 
         /* stager dev */
-        printk(KERN_INFO "[ipip_rcv] outer: [%pI4, %pI4]; inner: [%pI4, %pI4]\n",
-            &iph->saddr, &iph->daddr, &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr);
+        // printk(KERN_INFO "[ipip_rcv] outer: [%pI4, %pI4]; inner: [%pI4, %pI4]\n",
+        //     &iph->saddr, &iph->daddr, &ip_hdr(skb)->saddr, &ip_hdr(skb)->daddr);
         if ((in_aton("192.168.0.2") == iph->daddr) ||
             (in_aton("192.168.1.2") == iph->daddr)) {
             add_l4_flow_to_iface(skb, 0);
@@ -946,7 +1089,7 @@ static int ipip_rcv(struct sk_buff *skb)
     rcu_read_unlock();
 
     /* stager dev */
-    printk(KERN_INFO "    tunnel_lookup returned NULL && packet dropped\n");
+    // printk(KERN_INFO "    tunnel_lookup returned NULL && packet dropped\n");
 
     return -1;
 }
@@ -976,7 +1119,7 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
     /* stager dev */
     __be32 mangle_dst;
     __be32 mangle_src;
-    printk(KERN_INFO "* ipip_tunnel_xmit\n");
+    // printk(KERN_INFO "* ipip_tunnel_xmit\n");
 
 
     if (skb->protocol != htons(ETH_P_IP))
@@ -1002,7 +1145,7 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
         printk(KERN_INFO "[ipip_tunnel_xmit] Not a TCP flow. Using default iface [0]\n");
         i = 0;
     }
-    printk(KERN_INFO "[ipip_tunnel_xmit] Sending packet on iface: eth%d.\n", i);
+    // printk(KERN_INFO "[ipip_tunnel_xmit] Sending packet on iface: eth%d.\n", i);
 
     /* Need to mangle if 1 */
     if (i == 1){
@@ -1137,7 +1280,7 @@ static void ipip_tunnel_bind_dev(struct net_device *dev)
     const struct iphdr *iph;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_bind_dev\n");
+    // printk(KERN_INFO "* ipip_tunnel_bind_dev\n");
 
     tunnel = netdev_priv(dev);
     iph = &tunnel->parms.iph;
@@ -1179,7 +1322,7 @@ ipip_tunnel_ioctl (struct net_device *dev, struct ifreq *ifr, int cmd)
     struct ipip_net *ipn = net_generic(net, ipip_net_id);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_ioctl\n");
+    // printk(KERN_INFO "* ipip_tunnel_ioctl\n");
 
     switch (cmd) {
     case SIOCGETTUNNEL:
@@ -1291,7 +1434,7 @@ done:
 static int ipip_tunnel_change_mtu(struct net_device *dev, int new_mtu)
 {
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_change_mtu\n");
+    // printk(KERN_INFO "* ipip_tunnel_change_mtu\n");
 
     if (new_mtu < 68 || new_mtu > 0xFFF8 - sizeof(struct iphdr))
         return -EINVAL;
@@ -1310,7 +1453,7 @@ static const struct net_device_ops ipip_netdev_ops = {
 static void ipip_dev_free(struct net_device *dev)
 {
     /* stager dev */
-    printk(KERN_INFO "* ipip_dev_free\n");
+    // printk(KERN_INFO "* ipip_dev_free\n");
 
     free_percpu(dev->tstats);
     free_netdev(dev);
@@ -1319,7 +1462,7 @@ static void ipip_dev_free(struct net_device *dev)
 static void ipip_tunnel_setup(struct net_device *dev)
 {
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_setup: filling the net_device structure\n");
+    // printk(KERN_INFO "* ipip_tunnel_setup: filling the net_device structure\n");
 
     dev->netdev_ops     = &ipip_netdev_ops;
     dev->destructor     = ipip_dev_free;
@@ -1340,9 +1483,9 @@ static int ipip_tunnel_init(struct net_device *dev)
     struct ip_tunnel *tunnel = netdev_priv(dev);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_tunnel_init\n");
-    printk(KERN_INFO "    saddr: [%pI4]; daddr: [%pI4]\n",
-        &tunnel->parms.iph.saddr, &tunnel->parms.iph.daddr);
+    // printk(KERN_INFO "* ipip_tunnel_init\n");
+    // printk(KERN_INFO "    saddr: [%pI4]; daddr: [%pI4]\n",
+    //     &tunnel->parms.iph.saddr, &tunnel->parms.iph.daddr);
 
     tunnel->dev = dev;
 
@@ -1365,8 +1508,8 @@ static int __net_init ipip_fb_tunnel_init(struct net_device *dev)
     struct ipip_net *ipn = net_generic(dev_net(dev), ipip_net_id);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_fb_tunnel_init\n");
-    printk(KERN_INFO "    dev->name: [%s]\n", dev->name);
+    // printk(KERN_INFO "* ipip_fb_tunnel_init\n");
+    // printk(KERN_INFO "    dev->name: [%s]\n", dev->name);
 
     tunnel->dev = dev;
     strcpy(tunnel->parms.name, dev->name);
@@ -1398,7 +1541,7 @@ static void ipip_destroy_tunnels(struct ipip_net *ipn, struct list_head *head)
     int prio;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_destroy_tunnels\n");
+    // printk(KERN_INFO "* ipip_destroy_tunnels\n");
 
     for (prio = 1; prio < 4; prio++) {
         int h;
@@ -1421,7 +1564,7 @@ static int __net_init ipip_init_net(struct net *net)
     int err;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_init_net\n");
+    // printk(KERN_INFO "* ipip_init_net\n");
 
     ipn->tunnels[0] = ipn->tunnels_wc;
     ipn->tunnels[1] = ipn->tunnels_l;
@@ -1462,8 +1605,8 @@ static void __net_exit ipip_exit_net(struct net *net)
     LIST_HEAD(list);
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_exit_net\n");
-    printk(KERN_INFO "    net->proc_net->name: [%s]\n", net->proc_net->name);
+    // printk(KERN_INFO "* ipip_exit_net\n");
+    // printk(KERN_INFO "    net->proc_net->name: [%s]\n", net->proc_net->name);
 
     rtnl_lock();
     ipip_destroy_tunnels(ipn, &list);
@@ -1484,7 +1627,7 @@ static int __init ipip_init(void)
     int err;
 
     /* stager dev */
-    printk(KERN_INFO "* ipip_init\n");
+    // printk(KERN_INFO "* ipip_init\n");
 
     printk(banner);
 
@@ -1502,7 +1645,7 @@ static int __init ipip_init(void)
 static void __exit ipip_fini(void)
 {
     /* stager dev */
-    printk(KERN_INFO "* ipip_fini\n");
+    // printk(KERN_INFO "* ipip_fini\n");
 
     if (xfrm4_tunnel_deregister(&ipip_handler, AF_INET))
         pr_info("%s: can't deregister tunnel\n", __func__);
