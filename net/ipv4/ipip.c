@@ -141,7 +141,7 @@
 */
 #define PATHS_COUNT 2
 #define TRACKER_INTERVAL 950
-#define RESTAGE_TIMEOUT 2000
+#define RESTAGE_TIMEOUT 4000
 #define FLOW_SWITCH_TIMEOUT 10000
 
 
@@ -237,18 +237,23 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     /* Get the last RTT */
     rtt_instant = tcp_time_stamp - rx_opt->rcv_tsecr;
 
+    /* Ignore if unrealistic RTT values */
     if (rtt_instant > 250)
         return;
 
-    rcu_assign_pointer(this_srtt, &srtt[iface]);
-    rcu_assign_pointer(this_cf, &cf[iface]);
-    rcu_assign_pointer(this_srtt_rest, &srtt_rest[iface]);
+    this_srtt = &rcu_dereference(srtt)[iface];
+    this_srtt_min = &rcu_dereference(srtt_min)[iface];
+    this_cf = &rcu_dereference(cf)[iface];
+    this_srtt_rest = &rcu_dereference(srtt_rest)[iface];
+
 
     if (*this_srtt == 0){
         *this_srtt = rtt_instant;
     } else {
         /* Compute the average RTT */
-        temp_srtt = 980*(*this_srtt)*1000 + 980*(*this_srtt_rest) + 20*rtt_instant*1000;
+        temp_srtt = 975*(*this_srtt)*1000 +
+                    975*(*this_srtt_rest) +
+                    25*rtt_instant*1000;
         temp_srtt = temp_srtt / 1000;
         *this_srtt = temp_srtt / 1000;
         *this_srtt_rest = temp_srtt % 1000;
@@ -524,9 +529,9 @@ _do_restage(u16 *ideal_fc)
         to_iface = 1;
     }
 
-    if (fc_diff > 4)
+    if (fc_diff > 6)
     {
-        fc_diff = 4;
+        fc_diff = 6;
     }
 
     /* Static route simulation: comment the following line */
@@ -563,9 +568,11 @@ _stage_flows(void)
         {
             spin_lock_bh(&lock_restage);
 
-            if ((last_restage_ts == 0) ||
-                 (jiffies_to_msecs(tcp_time_stamp - last_restage_ts)
-                    > RESTAGE_TIMEOUT))
+            if ( /* Conditions to throttle the restaging events */
+                    (srtt_min[1] == USHRT_MAX) ||   /* early restage */
+                    (last_restage_ts == 0) ||       /* or first restage */
+                    (jiffies_to_msecs(tcp_time_stamp - last_restage_ts)
+                        > RESTAGE_TIMEOUT))         /* or timeout achieved */
             {
                 last_restage_ts = tcp_time_stamp;
                 should_restage = 1;
