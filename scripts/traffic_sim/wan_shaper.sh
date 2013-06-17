@@ -35,8 +35,8 @@ modify_bandwidth() {
 
     tc qdisc replace dev $dev root tbf rate $bw burst 16KB latency $latency
 
-    echo "Bandwidth modified for $dev: ";
-    tc -s -d qdisc show dev $dev
+    echo "$dev: $bw";
+    #tc -s -d qdisc show dev $dev
 }
 
 init_shaper;
@@ -44,13 +44,14 @@ init_shaper;
 
 
 while true ; do
-    modify_bandwidth 'eth3' 3500Kbit 120ms
-    modify_bandwidth 'eth1' 2450Kbit 160ms
-
+    modify_bandwidth 'eth3' 3000Kbit 120ms
+    modify_bandwidth 'eth1' 2000Kbit 160ms
+    echo "---";
     sleep 40;
 
-    modify_bandwidth 'eth3' 2450Kbit 160ms
-    modify_bandwidth 'eth1' 3500Kbit 120ms
+    modify_bandwidth 'eth3' 2000Kbit 160ms
+    modify_bandwidth 'eth1' 3000Kbit 120ms
+    echo "---";
 
     sleep 40;
 done
