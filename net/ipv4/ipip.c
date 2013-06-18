@@ -144,7 +144,6 @@
 #define RESTAGE_TIMEOUT 4000
 #define FLOW_SWITCH_TIMEOUT 10000
 
-
 static DEFINE_SPINLOCK(lock_path_flows_count);
 static DEFINE_SPINLOCK(lock_update_flow);
 static DEFINE_SPINLOCK(lock_add_flow);
@@ -204,6 +203,14 @@ static u16 cf[PATHS_COUNT] = {0, 0};
 /* Last restaging timestamp */
 static u32 last_restage_ts = 0;
 
+
+/* The bucket used to establish if restage needed or not */
+static u32 congestion_bucket[PATHS_COUNT] = {0, 0};
+#define BUCKET_SIZE(pos) 5 * path_flows_count[pos]
+#define BUCKET_DRIP_TIMEOUT RESTAGE_TIMEOUT
+
+
+
 /*
     Should update the RTT average value per iface
 
@@ -214,7 +221,7 @@ _update_iface_stats(struct sk_buff *skb, int iface)
 {
     const u8 *hash_location; /* we'll ignore this anyway */
     struct tcp_options_received *rx_opt; /* defined in linux/tcp.h */
-    u16 *this_srtt, *this_srtt_min, *this_cf, *this_srtt_rest;
+    u16 *this_srtt, *this_srtt_min, *this_cf, *this_srtt_rest, prev_srtt;
     u64 temp_srtt;
     u32 rtt_instant;
     s32 rtt_diff;
@@ -246,6 +253,7 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     this_cf = &rcu_dereference(cf)[iface];
     this_srtt_rest = &rcu_dereference(srtt_rest)[iface];
 
+    prev_srtt = srtt[iface];
 
     if (*this_srtt == 0){
         *this_srtt = rtt_instant;
@@ -264,8 +272,14 @@ _update_iface_stats(struct sk_buff *skb, int iface)
         *this_srtt_min = *this_srtt;
 
     /* difference between the instant RTT and the smoothed RTT */
-    // rtt_diff = rtt_instant - *this_srtt;
-    // if (rtt_diff < 0) rtt_diff = 0;
+    if ((prev_srtt < *this_srtt) &&
+        (jiffies_to_msecs(tcp_time_stamp - last_restage_ts)
+                        > BUCKET_DRIP_TIMEOUT))
+    {
+        congestion_bucket[iface]++;
+            // printk(KERN_INFO "[staging] buckets: %d\t%d\n",
+            //     congestion_bucket[0], congestion_bucket[1]);
+    }
 
     rtt_diff = *this_srtt - *this_srtt_min;
     if (rtt_diff < 0) rtt_diff = 0;
@@ -275,10 +289,12 @@ _update_iface_stats(struct sk_buff *skb, int iface)
     *this_cf = *this_srtt / 10;
 
 
-    printk(KERN_INFO "[stager][_update_iface_stats] Final stats for iface %d "
-        "[rtt] %d [srtt] %d %d [srtt_min] %d %d [rttd] %d [rest] %d %d\n",
-        iface, rtt_instant, srtt[0], srtt[1], srtt_min[0], srtt_min[1],
-        rtt_diff, srtt_rest[0], srtt_rest[1]);
+    // printk(KERN_INFO "[stager][_update_iface_stats] Final stats for iface %d "
+    //     "[rtt] %d [srtt] %d %d [srtt_min] %d %d [rttd] %d [rest] %d %d\n",
+    //     iface, rtt_instant, srtt[0], srtt[1], srtt_min[0], srtt_min[1],
+    //     rtt_diff, srtt_rest[0], srtt_rest[1]);
+    printk(KERN_INFO "[stager] [_update_iface_stats] cfactors: %d %d\n",
+        cf[0], cf[1]);
 }
 
 
@@ -489,8 +505,8 @@ _do_flows_switch(u16 count, u16 from, u16 to)
             path_flows_count[to]++;
             spin_unlock_bh(&lock_path_flows_count);
 
-            printk(KERN_INFO "[staging] %u %d -> %d\n",
-                u_flow->src_port, from, to);
+            // printk(KERN_INFO "[staging] %u %d -> %d\n",
+            //     u_flow->src_port, from, to);
 
             if (still_switching == 0)
                 break;
@@ -563,19 +579,24 @@ _stage_flows(void)
     /* Establish if we'll need to restage */
     for (i = 0; i < PATHS_COUNT; ++i)
     {
-        if ((10*(srtt[i] - (srtt_min[i])) > 5*srtt_min[i]) &&
-            (10*abs(last_restage_srtt_val[i] - srtt[i]) > 5*srtt_min[i]))
+        if ((congestion_bucket[i] > BUCKET_SIZE(i)) ||
+            (last_restage_ts == 0))       /* or first restage */
         {
             spin_lock_bh(&lock_restage);
 
             if ( /* Conditions to throttle the restaging events */
                     (srtt_min[1] == USHRT_MAX) ||   /* early restage */
-                    (last_restage_ts == 0) ||       /* or first restage */
                     (jiffies_to_msecs(tcp_time_stamp - last_restage_ts)
                         > RESTAGE_TIMEOUT))         /* or timeout achieved */
             {
                 last_restage_ts = tcp_time_stamp;
                 should_restage = 1;
+                congestion_bucket[0] = 0;
+                congestion_bucket[1] = 0;
+            }
+            else {
+                congestion_bucket[0] = congestion_bucket[0] / 2;
+                congestion_bucket[1] = congestion_bucket[1] / 2;
             }
 
             spin_unlock_bh(&lock_restage);
@@ -644,13 +665,13 @@ _stage_flows(void)
             _do_restage(ideal_fc);
         }
 
-        printk(KERN_INFO
-            "[stager] tc_total %d fc %d %d tc %d %d tw %d %d; last srtt %d %d\n",
-            tc_total,
-            path_flows_count[0], path_flows_count[1],
-            ideal_fc[0], ideal_fc[1],
-            tw[0], tw[1],
-            last_restage_srtt_val[0], last_restage_srtt_val[1]);
+        // printk(KERN_INFO
+        //     "[stager] tc_total %d fc %d %d tc %d %d tw %d %d; last srtt %d %d\n",
+        //     tc_total,
+        //     path_flows_count[0], path_flows_count[1],
+        //     ideal_fc[0], ideal_fc[1],
+        //     tw[0], tw[1],
+        //     last_restage_srtt_val[0], last_restage_srtt_val[1]);
     }
 }
 
@@ -664,7 +685,7 @@ get_iface_for_skb(struct sk_buff *skb)
     struct tcphdr *tcp_header;
     __be16 source_port;
     __be16 dest_port;
-    int result = 0;
+    int iface = -1;
     struct l4_flow *p;
 
 #ifdef STAGER_SITE_A
@@ -676,35 +697,43 @@ get_iface_for_skb(struct sk_buff *skb)
     source_port = ntohs(tcp_header->source);
     dest_port = ntohs(tcp_header->dest);
 
-
-#ifdef STAGER_SITE_A
-    /* Temporary fix to have at least 1 flow on eth1 */
-    if( (dest_port & 0x01) == 0 && (srtt_min[1] == USHRT_MAX) ){
-
-    /* Static route simulation: even-numbered ports routed through iface 1 */
-    // if ((dest_port & 0x01) == 0){
-    //     printk(KERN_INFO
-    //         "[get_iface_for_skb] Traffic on port even-number [%d] is routed through iface 1.\n",
-    //             dest_port);
-        return 1;
-    }
-    // else {
-    //     return 0;
-    // }
-#endif
-
     rcu_read_lock();
     list_for_each_entry_rcu(p, &flows_head, flows_list)
     {
         if ((p->src_port == dest_port) && (p->dst_port == source_port))
         {
-            result = p->path_id;
+            iface = p->path_id;
             break;
         }
     }
     rcu_read_unlock();
 
-    return result;
+    /* not found .. */
+    if (iface == -1)
+    {
+#ifdef STAGER_SITE_A
+        /* Temporary fix to have at least 1 flow on eth1 */
+        if( ((dest_port & 0x01) == 0) &&
+            ((srtt_min[1] == USHRT_MAX) || (srtt_min[0] == USHRT_MAX))
+            ){
+
+        /* Static route simulation: even-numbered ports routed through iface 1 */
+        // if ((dest_port & 0x01) == 0){
+        //     printk(KERN_INFO
+        //         "[get_iface_for_skb] Traffic on port even-number [%d] is routed through iface 1.\n",
+        //             dest_port);
+            return 1;
+        }
+        else {
+            return 0;
+        }
+#else
+        iface = 0;
+#endif
+    }
+
+
+    return iface;
 }
 
 /* Stager Dev END */
