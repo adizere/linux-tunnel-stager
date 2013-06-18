@@ -563,8 +563,10 @@ _stage_flows(void)
     /* Establish if we'll need to restage */
     for (i = 0; i < PATHS_COUNT; ++i)
     {
+        // if ((10*(srtt[i] - (srtt_min[i])) > 5*srtt_min[i]) &&
+        //     (10*abs(last_restage_srtt_val[i] - srtt[i]) > 5*srtt_min[i]))
         if ((10*(srtt[i] - (srtt_min[i])) > 5*srtt_min[i]) &&
-            (10*abs(last_restage_srtt_val[i] - srtt[i]) > 5*srtt_min[i]))
+            (abs(last_restage_srtt_val[i] - srtt[i]) > srtt_min[i]))
         {
             spin_lock_bh(&lock_restage);
 
