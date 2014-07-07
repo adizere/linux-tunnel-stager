@@ -1,0 +1,151 @@
+<html>
+<head>
+  <title>Various notes about queuing, latencies, traffic-shaping in linux networks</title>
+</head>
+<body>
+<b><align="center">Various notes about queuing, latencies, traffic-shaping in linux networks</align></b><br>
+[This document is not corrected and not completed!]
+<p>
+Below are some notes about queuing latencyes, linux traffic-shaping and rates in computer 
+networks, notes which I gathered from personal experience, reading linux kernel code, 
+<a href="http://lartc.org">LARTC HOWTO</a> and google. I offer no waranty for the information
+below, however I do claim they are true. (Of course, I may be wrong).
+</p>
+<b>Introductory notes on queues and transport delays</b><br>
+First, some introductory notes. The <i>delay</i> (or latency) of a packet going from a source
+to a destination through the internet equals the time elapsed from the moment it was sent on
+the wire by the source computer up until the moment it is received by the destination 
+computer's operating system. The relation for computing the delay of a packet in the
+internet is the following:<br>
+Delay = Propagation_delay + Queuing_delay<br>
+Propagation_delay means the time it takes the packet to travel over a specific link (or
+over a set of links if there are several hops/routers on the path from the source computer
+to the destination computer) and it is equal to l/s where l is the length of the physical
+link and s is the signal propagation speed in medium (between 2*10^8 and 3*10^8 m/s).<br>
+Queuing_delay is the time our packet spends inside routers' queues along the path from
+the source to the destination. The purpose of queues inside routers is to accomodate with
+posible bandwidth fluctuations inside the network. It is important to note that, in internet,
+the biggest contributor to the delay value is the queuing delay, propagation delay being
+so small that is negligible.<br>
+Now, every router has an outgoing rate/bandwidth (also called capacity) which is the 
+maximum speed at which this router can send packets in the network - this is determined
+by engineering constraints. Lets assume that the outgoing rate or capacity of a router
+is X bytes/s. This means that our router can send X bytes worth of packets in 1 second.<br>
+In other words, if packets of size s bytes keep coming to the router, the router can send in 
+an one second interval of time maximum X/s packets. In the ideal case, sending an s bytes sized
+packet takes s/X units of time (seconds).<br>
+If the incoming rate at the router (lets call it from now on Y bytes/s) is smaller than 
+the outgoing rate X, than in the first (Y/X)*1000 miliseconds Y bytes will be sent on
+the outgoing interface and in the rest 1000*(1-Y/X) miliseconds nothing will be sent,
+thus available bandwidth remaining unused. On the other hand, if the incoming rate is 
+bigger than the outgoing rate (i.e. Y>X) only X out of Y bytes will be sent in 1 second.
+This is where the router's buffer (also called router's queue) comes into the picture.
+The remaining Y-X bytes out of Y bytes which arrive in an 1 second interval time are
+enqueued in the router's buffer (i.e. they form a queue inside the router) and are 
+scheduled for sending in the next second. If the router's buffer is not long enough
+to cope with the Y-X extra bytes, then some packets will be dropped by the router. 
+Lets denote the buffer's length in bytes by B. Therefore, during congestion, Y-X-B
+bytes will be dropped from the incoming flow (actually it is a little bit more than
+this because a router can drop  only whole packets not bytes).<br>
+This being said, we see that the minimum queuing delay of a packet is close to zero
+(when the incoming rate is smaller than the outgoing rate). The maximum queuing delay
+equals B/X seconds (assuming that Y>=X+B) because a packet can spend B/X seconds in
+the router's queue, when the queue is full, before being sent in the network (remember
+that for sending B bytes using an outgoing rate of X bytes/s, B/X seconds are required).<br> 
+
+<p><b>Notes on TBF</b><br>
+The Traffic Bucket Filter from the linux kernel (note I'm working with 2.6) is a traffic
+shaper used for slowing down an interface. TBF sends packets (i.e. dequeues packets from
+the queue) at the rate specified by the <i>rate</i> parameter. To achieve this smaller outgoing
+rate (i.e. to slow down the interface) TBF uses tokens for sending packets. 
+TBF considers that every second, R tokens are produced and
+placed into a bucket (this bucket can contain a maximum number of tokens given by the 
+<i>burst/buffer</i> parameter) where R is the <i>rate</i> parameter.
+A packet with the size of <i>s</i> bytes can only be sent if there are at 
+least s tokens available into the bucket. Therefore, if at the present moment 
+the bucket is empty, our packet can only be sent after at least s tokens 
+are produced (i.e. after s/R seconds). After the packet is sent, s tokens are 
+removed from the bucket. This way, we achieve an outgoing rate of R bytes/s, knowing
+that we can say that only after R tokens were produced (R tokens are produced 
+in 1 second), R bytes worth of packets were sent completely.<br>
+Now, to work only with integer numbers (and not floats like s/R), the TBF implementation
+works at a resolution of 1 us. This means that at each microsecond 1 token is produced and
+placed into a bucket. It also means that, if the bucket is empty, an s bytes sized packet
+can only be send after at least (s/R)*1000000 us.<br> 
+<br>
+So, if tbf_dequeue() is called by the kernel and there are at
+least s tokens in the queue where s is the size of the first packet from the queue,
+this packet is sent and s tokens are removed from the queue. This implies that
+if the kernel calls tbf_dequeue() very fast - one time after another, at differences 
+of less than 1 us - (which happens very often:) and there are B tokens available in 
+the bucket, B bytes worth of packets are sent almost instantly in a burst. That's why
+B (the size of the bucket) is given by the <i>burst</i> or <i>buffer</i> parameter.<br>
+If tbf_dequeue() is called by the kernel and there are only t tokens in
+the bucket (the number of tokens in the bucket is computed as min(now-t_c, burst) where
+now is the present time and t_c is the time of the last packet sending and
+burst is the maximum size of the bucket in tokens) and t&lt;s where s is the size of
+the first packet from the queue then no packet is transmitted, but a watchdog is
+set to execute after s-t microseconds. When executed, this watchdog schedules the net
+device to immediately request a packet for sending.<br>
+<br>
+The maximum queue delay (if not specified by the <i>latency</i> parameter) is computed
+using the following relation:<br>
+latency = (limit-burst)/rate seconds<br>
+where <i>limit</i>, <i>burst</i> and <i>rate</i> are the parameters from the command line.
+The <i>limit</i> parameter denotes the size of the queue in bytes. If the queue is full 
+next packets will be dropped.<br>
+<br>
+The values reported by tc -s -d qdisc show dev lo are:<br>
+buffer = burst/rate in us<br>
+tokens = burst/rate in us<br>
+rate = rate from the command line (rounded)<br>
+</p>
+
+When building a more sofisticated traffic shaper, when trying to set the maximum outgoing
+rate or the maximum queuing delay (latency) you must always make sure that you are operating
+on the slowest queue or the weakest link in the chain; you must "own the queue" so to speak.
+So, everytime something is not working as you think it should you must always wonder if you
+are operating on <i>THE QUEUE</i> or just another queue. <br>
+For example, in the following script: <br>
+
+tc qdisc add dev $DEV root handle 1:0 htb <br>
+tc class add dev $DEV parent 1:0 classid 1:1 htb rate 500Kbit burst 3kb <br>
+tc qdisc add dev $DEV parent 1:1 handle 10: tbf rate 1Mbit buffer 3kb limit 8.2kB <br>
+<br>
+tc filter add dev $DEV parent 1:0 protocol ip prio 1 u32 match ip dport 5557 0xffff flowid 1:1 <br>
+<br>
+the maximum latency is not the one given by the TBF qdisc 10: (that is 
+(8.2kb - 3kb)/1Mbit = 40.6 ms.) but is much higher (150 ms.). This is
+because the TBF qdisc is not the weakest queue - which is in fac the HTB class 1:1
+(because it has a rate of 500Kbit).<br>
+
+A solution for the above script to achieve lower latency is the following: <br>
+<br>
+tc qdisc add dev $DEV root handle 1:0 htb <br>
+tc class add dev $DEV parent 1:0 classid 1:1 htb rate 798.4Kbit burst 4.2kb cburst 4.2kb <br>
+tc qdisc add dev $DEV parent 1:1 handle 10:0 pfifo limit 8 <br>
+<br>
+tc filter add dev $DEV parent 1:0 protocol ip prio 1 u32 match ip dport 5557 0xffff flowid 1:1 <br>
+<br>
+That is, replace the default qdisc of a HTB class (which is a pfifo with a
+queue length equal to the <i>txqueuelen</i> of $DEV reported by <b>ifconfig</b>) with
+a pfifo qdisc with a queue length of 8 packets.<br>
+<br>
+Another solution is the the following script:<br>
+<br>
+tc qdisc add dev $DEV root handle 1:0 htb <br>
+tc class add dev $DEV parent 1:0 classid 1:1 htb rate 798.4Kbit burst 4.2kb cburst 4.2kb <br>
+tc qdisc add dev $DEV parent 1:1 handle 10:0 tbf rate 550kbit burst 5200 limit 5.2kb <br>
+<br>
+tc filter add dev $DEV parent 1:0 protocol ip prio 1 u32 match ip dport 5557 0xffff flowid 1:1 <br>
+<br>
+which achieves a maximum latency of 60 ms which is roughly obtained using the formula:<br>
+latency = tbf_limit/(max{htb_rate, htb_ceil} + max{htb_burst, htb_cburst}) = 5.2Kb/(798.4Kbit+4.2Kb)
+<br>
+
+
+
+ 
+</p>
+</body>
+</html>

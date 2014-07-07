@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Measures how much bandwidth is utilized in each second for a given net ifvogel1985
+# Measures how much bandwidth is utilized in each second for a given net if
 
 dev="eth0";
 steps=1;

@@ -12,6 +12,7 @@ modify_delay() {
     tc qdisc show dev $dev
 }
 
+tc qdisc change dev eth0 root netem delay 100ms 20ms distribution normal loss 10%
 
 modify_bandwidth() {
     dev=$1
@@ -45,7 +46,6 @@ init_shaper() {
 }
 
 init_shaper;
-
 
 while true ; do
     echo "--- " $(date);

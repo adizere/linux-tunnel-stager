@@ -140,7 +140,7 @@
     * concurrency control on all global variables with RCU and locks
 */
 #define PATHS_COUNT 2
-#define TRACKER_INTERVAL 950
+#define TRACKER_INTERVAL 900
 #define RESTAGE_TIMEOUT 4000
 #define FLOW_SWITCH_TIMEOUT 10000
 
@@ -529,9 +529,9 @@ _do_restage(u16 *ideal_fc)
         to_iface = 1;
     }
 
-    if (fc_diff > 6)
+    if (fc_diff > 12)
     {
-        fc_diff = 6;
+        fc_diff = 12;
     }
 
     /* Static route simulation: comment the following line */
